@@ -1,6 +1,6 @@
 # document-to-csv
 
-A typesafe TypeScript CLI that converts document images and PDFs into structured **CSV** or **Excel** files using local LLMs served by [LM Studio](https://lm-studio.ai).
+A typesafe TypeScript CLI that converts document images and PDFs into structured **CSV**, **Excel**, or **Word** files using local LLMs served by [LM Studio](https://lm-studio.ai).
 
 Two models collaborate:
 
@@ -65,13 +65,16 @@ pnpm --filter @workspace/scripts run document-to-csv <file> [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-o, --output <path>` | `<basename>.csv` / `.xlsx` | Output file path |
+| `-o, --output <path>` | `<basename>.csv` / `.xlsx` / `.docx` | Output file path |
 | `--excel` | off | Write `.xlsx` instead of `.csv` (see [Excel output](#excel-output)) |
+| `--word` | off | Write `.docx` from a PDF (see [Word output](#word-output)) |
 | `--lm-studio-url <url>` | `http://localhost:1234/v1` | LM Studio server URL |
 | `--ocr-model <id>` | `mlx-community/DeepSeek-OCR-8bit` | Vision/OCR model ID |
 | `--structurer-model <id>` | `zecanard/...` | Structuring model ID |
 | `-v, --verbose` | off | Step-by-step logging |
 | `-h, --help` | — | Show help |
+
+`--excel` and `--word` are mutually exclusive. `--word` requires a PDF input.
 
 ### Examples
 
@@ -85,6 +88,15 @@ pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --verbose
 # PDF → layout-faithful Excel file
 pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --excel
 
+# PDF → Word document (Arabic + Latin, resumable)
+pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word
+
+# PDF → Word, verbose, custom output path
+pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf \
+  --word \
+  --output ./exports/contract.docx \
+  --verbose
+
 # Custom output path, remote LM Studio
 pnpm --filter @workspace/scripts run document-to-csv ./statement.pdf \
   --excel \
@@ -96,7 +108,7 @@ pnpm --filter @workspace/scripts run document-to-csv ./statement.pdf \
 
 ## How it works
 
-### Image input
+### Mode 1 — Image → CSV / Excel
 
 ```
 Image file
@@ -108,7 +120,7 @@ Image file
                 Calls write_csv tool → CSV / Excel
 ```
 
-### PDF input
+### Mode 2 — PDF → CSV / Excel
 
 ```
 PDF file
@@ -120,7 +132,6 @@ PDF file
    ├─ Step 2 — Gemma4 visual verification (non-tool call)
    │    Receives: rendered page images + both text layers
    │    Produces: single reconciled, tab-delimited text
-   │    (corrects column misalignment between text layer and OCR)
    │
    └─ Step 3 — Gemma4 tool-use loop
                 Receives: verified text + page images
@@ -128,6 +139,39 @@ PDF file
 ```
 
 When `--excel` is used on a PDF, page layout data (text positions + image bounding boxes) is extracted in parallel with Step 1 at no extra cost.
+
+### Mode 3 — PDF → Word (`--word`)
+
+```
+PDF file
+   │
+   ├─ Step 1 — pdfjs text layer (all pages, structural)
+   │
+   └─ Per page (resumable — progress saved to .progress.json after each page):
+        │
+        ├─ Render page → JPEG (pdftoppm / mutool)
+        │
+        ├─ Pass 2 — DeepSeek-OCR
+        │    Prompt: document-structure-aware (headings, paragraphs, tables)
+        │    Preserves Arabic (RTL) and Latin characters
+        │
+        ├─ Pass 3 — Gemma4 direct vision extraction
+        │    Gemma4 reads the page image independently
+        │    Preserves Arabic (RTL) and Latin characters
+        │
+        └─ Pass 4 — Gemma4 corroboration
+             Receives: page image + all 3 text sources
+             Produces: single most accurate version of the page
+             Rules: trust content that appears in 2+ sources;
+                    use page image as visual ground truth
+
+→ Word generator builds .docx from corroborated page texts
+  Arabic paragraphs → bidirectional + right-aligned
+  Latin paragraphs  → left-to-right
+  Tables → tab-delimited rows reconstructed as Word tables
+  Headings → Word Heading 2 style
+  Each PDF page → new page in the Word document
+```
 
 ---
 
@@ -144,7 +188,25 @@ A layout-faithful reconstruction of the original PDF page:
 - **Text** — every text run from the PDF is placed in the cell that corresponds to its exact X/Y position. The page coordinate space (in PDF points) is mapped to a fine Excel grid (6 pt per column, 12 pt per row).
 - **Images** — images embedded in the PDF (logos, charts, stamps, etc.) are detected by replaying the PDF's drawing operator list and tracking the current transformation matrix (CTM). Each detected image region is cropped from the rendered page raster using [sharp](https://sharp.pixelplumbing.com) and embedded in the Excel sheet anchored to the cell at the matching position.
 
-The result is an Excel file where you can see both the clean extracted table (Data sheet) and a view of the original document with images in their correct relative positions (Document sheet).
+---
+
+## Word output
+
+When `--word` is passed on a PDF, a `.docx` file is produced with:
+
+- **Structure preserved** — headings, paragraphs, tables, and lists are reconstructed from the corroborated text.
+- **Arabic RTL support** — paragraphs and table cells containing Arabic text are automatically marked bidirectional with right alignment so Word renders them correctly.
+- **One Word page per PDF page** — each PDF page starts on a new page in the output document.
+- **Resumable** — a `.progress.json` file is written next to the output file after every completed page. If the process is interrupted, re-running the same command picks up exactly where it left off. Delete the progress file to force a complete re-run.
+
+```bash
+# First run (processes pages 1–20, interrupted at page 12)
+pnpm --filter @workspace/scripts run document-to-csv ./doc.pdf --word
+# → doc.progress.json contains pages 1–12
+
+# Second run (reads pages 1–12 from cache, resumes at page 13)
+pnpm --filter @workspace/scripts run document-to-csv ./doc.pdf --word
+```
 
 ---
 
@@ -152,36 +214,42 @@ The result is an Excel file where you can see both the clean extracted table (Da
 
 | Component | File | Role |
 |-----------|------|------|
-| CLI entry | `scripts/src/document-to-csv.ts` | Argument parsing, orchestration, step logging |
+| CLI entry | `scripts/src/document-to-csv.ts` | Argument parsing, orchestration, mode routing |
 | Types | `scripts/src/types.ts` | Zod schemas + TypeScript interfaces for all data shapes |
 | LM Studio client | `scripts/src/lm-studio-client.ts` | Typed OpenAI-compatible client factory |
-| OCR | `scripts/src/ocr.ts` | `callOcrModel()` — base64 encode + DeepSeek-OCR vision call |
-| PDF extraction | `scripts/src/pdf.ts` | pdfjs text layer + DeepSeek-OCR pass + layout extraction for Excel |
-| CSV generation | `scripts/src/csv-generator.ts` | `verifyDocumentWithGemma()` pre-pass + `generateCsvWithGemma()` agentic loop |
+| OCR | `scripts/src/ocr.ts` | `callOcrModel()` — base64 encode + DeepSeek-OCR vision call; two system prompts (CSV mode, Word mode) |
+| PDF extraction | `scripts/src/pdf.ts` | pdfjs text layer + DeepSeek-OCR pass + layout extraction for Excel + raw per-page texts for Word |
+| CSV generation | `scripts/src/csv-generator.ts` | `verifyDocumentWithGemma()` pre-pass + `generateCsvWithGemma()` agentic tool-use loop |
 | Excel generation | `scripts/src/excel-generator.ts` | `generateExcel()` — styled Data sheet + layout-faithful Document sheet |
+| PDF → Word pipeline | `scripts/src/pdf-to-word.ts` | 4-pass per-page extraction, progress tracking, corroboration |
+| Word generation | `scripts/src/word-generator.ts` | `generateWordDoc()` — docx with Arabic RTL, headings, tables, page breaks |
 
 ### Key decisions
 
 - **LM Studio via OpenAI SDK** — LM Studio exposes an OpenAI-compatible `/v1` endpoint, so the standard `openai` npm package is used directly. No custom HTTP layer needed.
-- **Three-pass PDF pipeline** — (1) pdfjs text layer for structure, (2) DeepSeek-OCR for visual verification, (3) Gemma4 reconciliation before CSV generation. This gives better results than any single source alone.
-- **Agentic tool-use loop** — Gemma4 calls the `write_csv` tool up to 8 iterations. If it stops without calling the tool it is re-prompted automatically.
+- **Three-pass PDF→CSV pipeline** — (1) pdfjs text layer for structure, (2) DeepSeek-OCR for visual verification, (3) Gemma4 reconciliation before CSV generation. This gives better results than any single source alone.
+- **Four-pass PDF→Word pipeline** — the Word mode adds a third independent extraction pass (Gemma4 vision) then a dedicated corroboration step. Content confirmed by 2+ sources is trusted; single-source content is verified against the page image.
+- **Per-page progress persistence** — the Word pipeline writes a JSON progress file after every page. On restart, already-completed pages are loaded from the file instead of being re-processed. This makes long conversions safe to interrupt.
+- **Agentic tool-use loop (CSV/Excel)** — Gemma4 calls the `write_csv` tool up to 8 iterations. If it stops without calling the tool it is re-prompted automatically.
 - **Zod validation on every tool call** — `WriteCsvToolArgsSchema` validates Gemma4's `write_csv` arguments before accepting them.
 - **RFC 4180 CSV sanitizer** — the LLM's CSV output is re-parsed and re-serialized programmatically to guarantee correct quoting and consistent column counts.
-- **pdfjs-dist v5 legacy build** — the main ESM build requires DOM globals absent in Node.js. The legacy CJS build is loaded via `createRequire` (Node.js 22+ allows `require()` of `.mjs` files). `GlobalWorkerOptions.workerSrc` must point to the actual worker file; pdfjs v5 removed the in-process fake worker.
-- **CTM-tracked image detection** — PDF image positions are derived by replaying the operator list and accumulating the current transformation matrix through `save`/`restore`/`transform` ops. No raw PDF image object extraction needed — regions are cropped from the existing rendered raster.
+- **pdfjs-dist v5 legacy build** — the main ESM build requires DOM globals absent in Node.js. The legacy CJS build is loaded via `createRequire`. `GlobalWorkerOptions.workerSrc` must point to the actual worker file; pdfjs v5 removed the in-process fake worker.
+- **CTM-tracked image detection** — PDF image positions are derived by replaying the operator list and accumulating the current transformation matrix through `save`/`restore`/`transform` ops. Regions are cropped from the rendered raster using sharp.
+- **Arabic RTL in Word** — paragraphs and table cells containing Arabic Unicode characters are detected at render time and set `bidirectional: true` + `AlignmentType.RIGHT` + `rightToLeft: true` on text runs, producing correct RTL rendering in Microsoft Word without any manual markup.
 
 ---
 
 ## Supported document types
 
-| Type | Works best for |
-|------|---------------|
-| Invoices | Tabular line items, totals, key-value header fields |
-| Bank statements | Account summaries, transaction tables |
-| Reports | Multi-section documents, mixed text and tables |
-| Forms | Key-value pairs, checkboxes (visual toggle detection) |
-| Spreadsheet screenshots | Grid data, merged cells |
-| Scanned documents | Export pages as PNG/JPEG first, then pass to the CLI |
+| Type | CSV/Excel | Word |
+|------|-----------|------|
+| Invoices | Tabular line items, totals, key-value fields | Full layout with headings and tables |
+| Bank statements | Account summaries, transaction tables | Multi-page statements |
+| Contracts / legal | — | Multi-page documents, Arabic + Latin mixed |
+| Reports | Multi-section documents, mixed tables | Full narrative + tables |
+| Forms | Key-value pairs, checkboxes | Form fields as key-value text |
+| Spreadsheet screenshots | Grid data, merged cells | — |
+| Scanned documents | Export as PNG/JPEG first | Export as PNG/JPEG first |
 
 ---
 
