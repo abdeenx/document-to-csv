@@ -2,14 +2,15 @@
 /**
  * document-to-csv
  *
- * Converts a document image or PDF into a structured CSV (or Excel) file.
+ * Converts a document image or PDF into a structured CSV, Excel, or Word file.
  *
- * Image path:
+ * ── Mode 1: Image → CSV / Excel ──────────────────────────────────────────────
  *   1. DeepSeek-OCR (vision) extracts text
  *   2. Gemma4 (tool use) structures it into CSV / Excel
- *      The original image is forwarded to Gemma4 for visual column-alignment verification.
+ *      The original image is forwarded to Gemma4 for visual column-alignment
+ *      verification.
  *
- * PDF path:
+ * ── Mode 2: PDF → CSV / Excel ────────────────────────────────────────────────
  *   1. pdfjs-dist extracts the embedded text layer (structural / positional)
  *      DeepSeek-OCR runs on each rendered page for a second visual pass
  *   2. Gemma4 (non-tool) reconciles the page images + both text layers into
@@ -17,17 +18,27 @@
  *   3. Gemma4 (tool use) structures the verified text into CSV / Excel
  *      Page images are forwarded again so Gemma4 can verify column alignment
  *
- * With --excel on a PDF:
- *   A layout-faithful "Document" sheet is added to the workbook. Text items
- *   are placed at their PDF-grid positions, and any images detected in the PDF
- *   operator list are cropped from the rendered page renders and embedded at
- *   the matching cell anchor.
+ *   With --excel on a PDF:
+ *     A layout-faithful "Document" sheet is added to the workbook. Text items
+ *     are placed at their PDF-grid positions, and any images detected in the PDF
+ *     operator list are cropped from the rendered page renders and embedded at
+ *     the matching cell anchor.
+ *
+ * ── Mode 3: PDF → Word (.docx) ──────────────────────────────────────────────
+ *   Per page, four passes run:
+ *     1. pdfjs text layer   — structural text
+ *     2. DeepSeek-OCR       — visual extraction from a rendered page image
+ *     3. Gemma4 direct      — Gemma4's own vision extraction pass
+ *     4. Gemma4 corroborate — reconciles all 3 sources into the most accurate text
+ *
+ *   Arabic (RTL) and Latin text are both preserved.
+ *   Progress is saved after every page — resume safely if interrupted.
  *
  * Usage:
  *   pnpm --filter @workspace/scripts run document-to-csv <file> [options]
  */
 
-import { basename, extname, resolve } from "node:path";
+import { basename, extname, resolve, dirname } from "node:path";
 import { writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { CliArgsSchema } from "./types.js";
@@ -36,6 +47,7 @@ import { extractTextWithOcr } from "./ocr.js";
 import { extractTextFromPdf, extractPdfPageLayouts } from "./pdf.js";
 import { verifyDocumentWithGemma, generateCsvWithGemma } from "./csv-generator.js";
 import { generateExcel } from "./excel-generator.js";
+import { convertPdfToWord } from "./pdf-to-word.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -46,6 +58,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     options: {
       output:             { type: "string",  short: "o" },
       excel:              { type: "boolean", default: false },
+      word:               { type: "boolean", default: false },
       "lm-studio-url":    { type: "string" },
       "ocr-model":        { type: "string" },
       "structurer-model": { type: "string" },
@@ -60,6 +73,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(values.help ? 0 : 1);
   }
 
+  if (values.excel && values.word) {
+    console.error("Error: --excel and --word are mutually exclusive. Choose one.");
+    process.exit(1);
+  }
+
   const inputPath = positionals[0]!;
   const ext       = extname(inputPath).toLowerCase();
 
@@ -68,9 +86,19 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(1);
   }
 
+  if (values.word && ext !== PDF_EXTENSION) {
+    console.error("Error: --word mode requires a PDF input file.");
+    process.exit(1);
+  }
+
   const inputBase = basename(inputPath, extname(inputPath));
   const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
-  const outputExt = values.excel ? ".xlsx" : ".csv";
+
+  let outputExt: string;
+  if (values.excel) outputExt = ".xlsx";
+  else if (values.word) outputExt = ".docx";
+  else outputExt = ".csv";
+
   const defaultOutput = resolve(callerCwd, `${inputBase}${outputExt}`);
 
   const raw = {
@@ -82,6 +110,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     verbose: values.verbose ?? false,
     excel:   values.excel   ?? false,
+    word:    values.word    ?? false,
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -97,7 +126,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
 
 function printUsage(): void {
   console.log(`
-document-to-csv — Convert a document image or PDF to a structured CSV or Excel file
+document-to-csv — Convert a document image or PDF to CSV, Excel, or Word
 
 Usage:
   pnpm --filter @workspace/scripts run document-to-csv <file> [options]
@@ -107,19 +136,25 @@ Arguments:
                                Images: jpg, jpeg, png, gif, webp
                                  → OCR via DeepSeek-OCR, then structured by Gemma4
                                PDF:    pdf
-                                 → pdfjs text layer + DeepSeek-OCR per page,
-                                   then Gemma4 visual verification + structuring
+                                 → Three modes available (see flags below)
 
 Options:
   -o, --output <path>          Output file path
-                               Default: <basename>.csv (or .xlsx with --excel)
-  --excel                      Write an Excel (.xlsx) file instead of CSV.
+                               Default: <basename>.csv / .xlsx / .docx
+  --excel                      Write an Excel (.xlsx) file (PDF or image input).
                                For PDF inputs the workbook contains:
                                  "Data"      — clean structured table
-                                 "Document"  — layout-faithful sheet where
-                                               text lands at its PDF position
-                                               and PDF images are embedded at
-                                               the matching cell location
+                                 "Document"  — layout-faithful sheet (text at PDF
+                                               positions, embedded images)
+  --word                       Write a Word (.docx) file (PDF input only).
+                               Runs four passes per page:
+                                 1. pdfjs text layer
+                                 2. DeepSeek-OCR visual extraction
+                                 3. Gemma4 direct vision extraction
+                                 4. Gemma4 corroboration of all 3 sources
+                               Arabic (RTL) and Latin text are both preserved.
+                               Progress is saved after every page — re-run the
+                               same command to resume if interrupted.
   --lm-studio-url <url>        LM Studio base URL (default: http://localhost:1234/v1)
   --ocr-model <id>             OCR model (default: mlx-community/DeepSeek-OCR-8bit)
   --structurer-model <id>      Structuring model
@@ -127,13 +162,15 @@ Options:
   -v, --verbose                Enable step-by-step logging
   -h, --help                   Show this help message
 
-PDF renderer (required for OCR + image embedding in --excel mode):
+PDF renderer (required for OCR passes and --excel image embedding):
   brew install poppler          # provides pdftoppm  ← recommended
   brew install mupdf-tools      # provides mutool    ← fallback
 
 Examples:
   pnpm --filter @workspace/scripts run document-to-csv ./invoice.png
   pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --excel --verbose
+  pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word
+  pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word --verbose
   pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --output ./data/report.xlsx --excel
 `);
 }
@@ -142,6 +179,36 @@ async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
 
+  // ── Mode 3: PDF → Word ────────────────────────────────────────────────────
+  if (args.word) {
+    const progressPath = args.outputPath!.replace(/\.docx$/i, ".progress.json");
+
+    console.log("document-to-csv (PDF → Word mode)");
+    console.log("==================================");
+    console.log(`  Input:         ${args.imagePath}`);
+    console.log(`  Output:        ${args.outputPath}`);
+    console.log(`  Progress file: ${progressPath}`);
+    console.log(`  OCR model:     ${args.ocrModel}`);
+    console.log(`  Struct model:  ${args.structurerModel}`);
+    console.log(`  LM Studio:     ${args.lmStudioUrl}`);
+    console.log("");
+
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+
+    await convertPdfToWord({
+      pdfPath:          args.imagePath,
+      outputPath:       args.outputPath!,
+      progressPath,
+      client,
+      ocrModelId:       args.ocrModel,
+      structurerModelId: args.structurerModel,
+      verbose:          args.verbose,
+    });
+
+    return;
+  }
+
+  // ── Mode 1 & 2: Image/PDF → CSV / Excel ──────────────────────────────────
   console.log("document-to-csv");
   console.log("================");
   console.log(`  Input:        ${args.imagePath}`);
