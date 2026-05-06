@@ -50,6 +50,19 @@ export async function extractTextWithOcr(
     model: modelId,
     messages: [
       {
+        role: "system",
+        content: [
+          "You are a precise OCR engine.",
+          "Your only job is to extract every piece of text visible in the image — nothing else.",
+          "Rules:",
+          "- Output ONLY the text that appears in the image. No commentary, no summaries, no explanations.",
+          "- Preserve the spatial layout: maintain rows, columns, and indentation as they appear.",
+          "- For tables and grids, use tab characters between columns and newlines between rows.",
+          "- Include every header, label, value, number, symbol, and special character exactly as shown.",
+          "- Do not paraphrase, infer, or add anything not visible in the image.",
+        ].join("\n"),
+      },
+      {
         role: "user",
         content: [
           {
@@ -58,17 +71,7 @@ export async function extractTextWithOcr(
           },
           {
             type: "text",
-            text: [
-              "You are a precise OCR engine. Extract ALL text from this image exactly as it appears.",
-              "Preserve:",
-              "- The original layout: rows, columns, tables, lists, and indentation",
-              "- All numbers, punctuation, symbols, and special characters",
-              "- Column/row headers and their alignment relationships",
-              "- Any structured groupings (sections, sub-sections, nested rows)",
-              "",
-              "Output ONLY the extracted text. Do not add commentary, summaries, or formatting beyond what is in the image.",
-              "If the image contains a table or spreadsheet, represent it with tab-separated values to preserve column alignment.",
-            ].join("\n"),
+            text: "Extract all text from this image.",
           },
         ],
       },
