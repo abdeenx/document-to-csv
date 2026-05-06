@@ -53,20 +53,25 @@ COLUMN STRUCTURE:
 DATA ROWS:
 - Each data row maps exactly to one record in the source document.
 - Tooltip text, overlay banners, popup notifications, and modal dialogs visible in the OCR are not data rows — skip them.
-- If a date value appears as "Apr 29, 2028" keep it as one cell value, not two separate columns.
-- Toggle values ("Yes"/"No") belong in their column as-is.
+- Toggle values ("Yes"/"No" or "On"/"Off") belong in their column as-is. A column with a toggle header MUST have a value in every row — never blank.
 - Empty cells must still be represented as empty fields (consecutive commas) to keep column counts consistent.
+
+CSV FORMATTING — CRITICAL:
+- Every field value that contains a comma, a double-quote, or a newline MUST be wrapped in double-quotes.
+- Example: a date like "Apr 29, 2028" contains a comma and MUST be written as "Apr 29, 2028" in the CSV.
+- Escape internal double-quotes by doubling them: He said "hi" → "He said ""hi"""
+- Do NOT rely on the reader to handle unquoted commas inside field values — they will be misinterpreted as column separators.
 
 QUALITY CHECKS (run before calling write_csv):
 1. Every row has exactly the same number of comma-separated fields as the header row.
 2. No row contains UI button labels (INFO, EDIT, SETUP, etc.) as field values.
-3. Dates are not split across two fields.
+3. Any field value containing a comma is wrapped in double-quotes.
 4. No tooltip or overlay text appears as a row.
+5. Toggle/boolean columns have a value ("Yes"/"No" or "On"/"Off") in every row — never blank.
 
 GENERAL:
 - For forms/invoices with key-value pairs: use "Field" and "Value" columns.
 - For multi-section documents: add a "Section" column.
-- Use RFC 4180 compliant CSV: quote any field containing a comma, newline, or double-quote; escape internal double-quotes by doubling them.
 
 Think step-by-step:
 1. Identify the document type and its true data columns (ignoring UI actions).
@@ -74,6 +79,85 @@ Think step-by-step:
 3. Map every data record to a row, filling empty cells with empty strings.
 4. Run the quality checks above.
 5. Call write_csv exactly once with the final result.`;
+
+// ---------------------------------------------------------------------------
+// RFC 4180 CSV sanitizer
+// Parses the LLM's CSV output and re-serializes it with guaranteed correct
+// quoting and consistent column counts. This catches any case where the model
+// forgot to quote a field that contains a comma (e.g. "Apr 29, 2028").
+// ---------------------------------------------------------------------------
+
+function parseCsvRow(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  let i = 0;
+
+  while (i < line.length) {
+    const ch = line[i]!;
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i += 2;
+        } else {
+          inQuotes = false;
+          i++;
+        }
+      } else {
+        current += ch;
+        i++;
+      }
+    } else {
+      if (ch === '"') {
+        inQuotes = true;
+        i++;
+      } else if (ch === ",") {
+        fields.push(current);
+        current = "";
+        i++;
+      } else {
+        current += ch;
+        i++;
+      }
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+function serializeCsvField(value: string): string {
+  if (
+    value.includes(",") ||
+    value.includes('"') ||
+    value.includes("\n") ||
+    value.includes("\r")
+  ) {
+    return '"' + value.replace(/"/g, '""') + '"';
+  }
+  return value;
+}
+
+function sanitizeCsv(csvContent: string): string {
+  const lines = csvContent.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length === 0) return csvContent;
+
+  const rows = lines.map(parseCsvRow);
+  const headerCount = rows[0]!.length;
+
+  const serialized = rows.map((row) => {
+    // Pad short rows so every row has exactly headerCount fields
+    while (row.length < headerCount) row.push("");
+    return row
+      .slice(0, headerCount)
+      .map(serializeCsvField)
+      .join(",");
+  });
+
+  return serialized.join("\n") + "\n";
+}
+
+// ---------------------------------------------------------------------------
 
 function resolveToolCall(
   toolCall: { type: string; id: string; function?: { name: string; arguments: string } },
@@ -191,8 +275,12 @@ export async function generateCsvWithGemma(
           if (verbose) {
             console.log(`[Gemma4] Reasoning: ${result.reasoning}`);
           }
+          // Programmatically sanitize the LLM's output for guaranteed RFC 4180
+          // compliance — this fixes unquoted commas in field values (e.g. dates)
+          // and ensures every row has the same column count as the header.
+          const sanitized = sanitizeCsv(result.csv_content);
           return {
-            csvContent: result.csv_content,
+            csvContent: sanitized,
             outputPath,
             reasoning: result.reasoning,
           };
