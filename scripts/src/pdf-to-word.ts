@@ -152,6 +152,35 @@ async function saveProgress(
 }
 
 // ---------------------------------------------------------------------------
+// Strip model thinking / reasoning traces
+//
+// Some models (e.g. Gemma4 with reasoning enabled) wrap their chain-of-thought
+// in one of these patterns before the actual answer:
+//
+//   <|channel>thought  ...reasoning...  <channel|>
+//   <thinking>         ...reasoning...  </thinking>
+//   <think>            ...reasoning...  </think>
+//
+// We strip all such blocks and then trim, so only the final answer text
+// reaches the Word document.
+// ---------------------------------------------------------------------------
+
+function stripThinking(raw: string): string {
+  let text = raw;
+
+  // <|channel>thought ... <channel|>  (Gemma4 / LM Studio reasoning format)
+  text = text.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, "");
+
+  // <thinking> ... </thinking>
+  text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
+
+  // <think> ... </think>
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+
+  return text.trim();
+}
+
+// ---------------------------------------------------------------------------
 // Gemma4 direct vision extraction (pass 3)
 // ---------------------------------------------------------------------------
 
@@ -190,7 +219,7 @@ async function extractWithGemma4(
     temperature: 0.1,
   });
 
-  const text = response.choices[0]?.message.content?.trim() ?? "";
+  const text = stripThinking(response.choices[0]?.message.content ?? "");
 
   if (verbose) {
     console.log(
@@ -251,7 +280,7 @@ async function corroboratePage(
     temperature: 0.05,
   });
 
-  const result = response.choices[0]?.message.content?.trim() ?? "";
+  const result = stripThinking(response.choices[0]?.message.content ?? "");
 
   if (verbose) {
     console.log(
