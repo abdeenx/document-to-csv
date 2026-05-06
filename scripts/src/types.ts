@@ -21,6 +21,8 @@ export const CliArgsSchema = z.object({
   outputPath: z.string().optional(),
   lmStudioUrl: z.string().url().default("http://localhost:1234/v1"),
   ocrModel: z.string().default("mlx-community/DeepSeek-OCR-8bit"),
+  dotsOcrModel: z.string().default("mlx-community/dots.ocr-bf16"),
+  glmOcrModel: z.string().default("mlx-community/GLM-0CR-bf16"),
   structurerModel: z
     .string()
     .default(
@@ -115,6 +117,10 @@ export interface PageExtraction {
   pdfjsText: string;
   /** Text from the DeepSeek-OCR visual pass. */
   ocrText: string;
+  /** Text from the dots.ocr visual pass. */
+  dotsOcrText: string;
+  /** Text from the GLM-OCR visual pass. */
+  glmOcrText: string;
   /** Text from the Gemma4 direct vision extraction pass. */
   gemmaText: string;
   /** Final corroborated text (reconciled by Gemma4). */
@@ -134,6 +140,8 @@ export const WordProgressSchema = z.object({
     z.object({
       pdfjsText: z.string(),
       ocrText: z.string(),
+      dotsOcrText: z.string().default(""),
+      glmOcrText: z.string().default(""),
       gemmaText: z.string(),
       corroborated: z.string(),
     }),
