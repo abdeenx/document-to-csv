@@ -28,7 +28,7 @@ import sharp from "sharp";
 import type * as PdfJsLib from "pdfjs-dist";
 import type { TextItem, TextMarkedContent } from "pdfjs-dist/types/src/display/api.js";
 import type OpenAI from "openai";
-import type { OcrResult } from "./types.js";
+import type { OcrResult, PdfPageLayout, PdfTextItem, PdfImageRegion } from "./types.js";
 import { callOcrModel } from "./ocr.js";
 
 const execFile = promisify(execFileCb);
@@ -134,6 +134,39 @@ async function renderPageToJpeg(
     }
     return resizeForOcr(imgBuf, "image/png");
   }
+}
+
+// ---------------------------------------------------------------------------
+// PDF operator list constants for image detection
+// pdfjs-dist may export OPS — we prefer that but fall back to known values.
+// ---------------------------------------------------------------------------
+
+const _OPS = (pdfjsLib as unknown as Record<string, unknown>)["OPS"] as
+  | Record<string, number>
+  | undefined;
+
+const PDF_OPS_SAVE               = _OPS?.["save"]                ?? 13;
+const PDF_OPS_RESTORE            = _OPS?.["restore"]             ?? 14;
+const PDF_OPS_TRANSFORM          = _OPS?.["transform"]           ?? 109;
+const PDF_OPS_PAINT_IMAGE_XOBJ   = _OPS?.["paintImageXObject"]   ?? 85;
+const PDF_OPS_PAINT_JPEG_XOBJ    = _OPS?.["paintJpegXObject"]    ?? 82;
+const PDF_OPS_PAINT_IMGMASK_XOBJ = _OPS?.["paintImageMaskXObject"] ?? 88;
+
+/**
+ * Multiply two PDF 6-element matrices [a,b,c,d,e,f].
+ * result = m1 × m2  (m1 is already current; m2 is the new transform).
+ */
+function mulMat6(m1: number[], m2: number[]): number[] {
+  const [a, b, c, d, e, f] = m1 as [number, number, number, number, number, number];
+  const [ap, bp, cp, dp, ep, fp] = m2 as [number, number, number, number, number, number];
+  return [
+    a * ap + c * bp,
+    b * ap + d * bp,
+    a * cp + c * dp,
+    b * cp + d * dp,
+    a * ep + c * fp + e,
+    b * ep + d * fp + f,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -324,4 +357,118 @@ export async function extractTextFromPdf(
     rawText: pdfjsRawText,
     model: "pdfjs-text-extract",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Layout extraction for Excel output
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract per-page layout data (text item positions + image bounding boxes)
+ * from a PDF. Called only when `--excel` is used so there is no overhead in
+ * the normal CSV path.
+ *
+ * Image bounding boxes are detected by replaying the PDF operator list and
+ * tracking the Current Transformation Matrix (CTM) through save/restore/
+ * transform ops.  When a paint-image op is encountered the CTM encodes the
+ * image's position and size in PDF user-space.
+ */
+export async function extractPdfPageLayouts(
+  pdfPath: string,
+  verbose: boolean,
+): Promise<PdfPageLayout[]> {
+  if (verbose) console.log(`[PDF-Layout] Loading: ${pdfPath}`);
+
+  const buffer = await readFile(pdfPath);
+  const doc    = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+
+  const layouts: PdfPageLayout[] = [];
+
+  for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    const page     = await doc.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
+    const pageWidth  = viewport.width;
+    const pageHeight = viewport.height;
+
+    // ── Text items ──────────────────────────────────────────────────────────
+    const textContent = await page.getTextContent();
+    const textItems: PdfTextItem[] = [];
+
+    for (const raw of textContent.items) {
+      if (!isTextItem(raw) || !raw.str.trim()) continue;
+      const t = raw.transform; // [a, b, c, d, e, f]
+      // Font size ≈ Euclidean norm of the first column of the matrix
+      const fontSize = Math.sqrt((t[0] ?? 0) ** 2 + (t[1] ?? 0) ** 2);
+      textItems.push({
+        x:        t[4] ?? 0,
+        y:        t[5] ?? 0,       // PDF baseline from bottom
+        str:      raw.str,
+        fontSize: fontSize || 10,
+        width:    raw.width ?? 0,
+      });
+    }
+
+    // ── Image regions via operator list ─────────────────────────────────────
+    // We replay every drawing op, tracking the CTM via save/restore/transform.
+    // When a paint-image op fires the CTM encodes position + size.
+    const opList = await page.getOperatorList();
+    const imageRegions: PdfImageRegion[] = [];
+
+    let   ctm: number[]   = [1, 0, 0, 1, 0, 0];  // identity
+    const ctmStack: number[][] = [];
+
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      const fn   = opList.fnArray[i]!;
+      const args = opList.argsArray[i] as number[] | undefined;
+
+      if (fn === PDF_OPS_SAVE) {
+        ctmStack.push([...ctm]);
+      } else if (fn === PDF_OPS_RESTORE) {
+        if (ctmStack.length > 0) ctm = ctmStack.pop()!;
+      } else if (fn === PDF_OPS_TRANSFORM && args && args.length >= 6) {
+        ctm = mulMat6(ctm, args);
+      } else if (
+        fn === PDF_OPS_PAINT_IMAGE_XOBJ ||
+        fn === PDF_OPS_PAINT_JPEG_XOBJ  ||
+        fn === PDF_OPS_PAINT_IMGMASK_XOBJ
+      ) {
+        // CTM [a,b,c,d,e,f]: image unit square → parallelogram
+        // For axis-aligned images (no rotation): a=width, d=height, e=x, f=y (bottom-left).
+        // Guard against degenerate or tiny transforms (artefacts / hairlines).
+        const imgLeft  = Math.min(ctm[4]!, ctm[4]! + ctm[0]!);
+        const imgRight = Math.max(ctm[4]!, ctm[4]! + ctm[0]!);
+        const imgBot   = Math.min(ctm[5]!, ctm[5]! + ctm[3]!);
+        const imgTop   = Math.max(ctm[5]!, ctm[5]! + ctm[3]!);
+
+        const w = imgRight - imgLeft;
+        const h = imgTop   - imgBot;
+
+        // Skip tiny artefacts (< 5 pt) and regions outside the page
+        if (w < 5 || h < 5 || imgLeft < 0 || imgBot < 0) continue;
+        if (imgRight > pageWidth * 1.05 || imgTop > pageHeight * 1.05) continue;
+
+        imageRegions.push({ x: imgLeft, y: imgBot, width: w, height: h });
+
+        if (verbose) {
+          console.log(
+            `[PDF-Layout] Page ${pageNum}: image @ x=${imgLeft.toFixed(0)} ` +
+            `y=${imgBot.toFixed(0)} w=${w.toFixed(0)} h=${h.toFixed(0)}`,
+          );
+        }
+      }
+    }
+
+    page.cleanup();
+
+    if (verbose) {
+      console.log(
+        `[PDF-Layout] Page ${pageNum}: ${textItems.length} text item(s), ` +
+        `${imageRegions.length} image region(s)`,
+      );
+    }
+
+    layouts.push({ pageWidth, pageHeight, textItems, imageRegions });
+  }
+
+  return layouts;
 }
