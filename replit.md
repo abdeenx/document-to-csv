@@ -4,7 +4,7 @@ A typesafe TypeScript CLI that uses DeepSeek-OCR (vision) + Gemma4 (tool use) vi
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/scripts run document-to-csv <image> [options]` — main CLI
+- `pnpm --filter @workspace/scripts run document-to-csv <file> [options]` — main CLI (image or PDF)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
@@ -25,9 +25,10 @@ A typesafe TypeScript CLI that uses DeepSeek-OCR (vision) + Gemma4 (tool use) vi
 
 - `scripts/src/types.ts` — all Zod schemas and TypeScript types
 - `scripts/src/lm-studio-client.ts` — typed OpenAI client factory pointing at LM Studio
-- `scripts/src/ocr.ts` — base64 image encoding + DeepSeek-OCR vision call
-- `scripts/src/csv-generator.ts` — Gemma4 tool-use agentic loop (`write_csv` tool)
-- `scripts/src/document-to-csv.ts` — CLI entry point with `parseArgs`
+- `scripts/src/ocr.ts` — base64 image encoding + DeepSeek-OCR vision call; returns preprocessed image for Gemma4 visual pass
+- `scripts/src/pdf.ts` — pdfjs-dist text extraction; reconstructs rows by Y-position grouping
+- `scripts/src/csv-generator.ts` — Gemma4 tool-use agentic loop (`write_csv` tool) + RFC 4180 sanitizer
+- `scripts/src/document-to-csv.ts` — CLI entry point; routes by extension (.pdf vs image)
 
 ## Architecture decisions
 
@@ -36,10 +37,12 @@ A typesafe TypeScript CLI that uses DeepSeek-OCR (vision) + Gemma4 (tool use) vi
 - **Agentic tool-use loop**: The Gemma4 step runs up to 8 iterations. It calls the `write_csv` tool once it has reasoned about the document structure. If it stops without calling the tool it is re-prompted automatically.
 - **Zod for tool argument validation**: Gemma4's `write_csv` tool call arguments are parsed through `WriteCsvToolArgsSchema` before being accepted, ensuring the CSV content is never silently malformed.
 - **Union type narrowing for tool calls**: OpenAI SDK's `ChatCompletionMessageToolCall` is a union; tool calls are narrowed via `type === "function"` guard before accessing `.function.name/.arguments`.
+- **Dual input modes**: images go through DeepSeek-OCR + Gemma4 vision (image forwarded to Gemma4 for column-alignment verification); PDFs go through pdfjs-dist text extraction + Gemma4 text-only (no OCR needed).
+- **pdfjs-dist legacy build via createRequire**: main ESM build requires DOM globals absent in Node.js; loading the legacy CJS build via `createRequire` works in Node.js 22+ which allows `require()` of `.mjs` modules.
 
 ## Product
 
-CLI harness: pass an image path, get a `.csv` file whose structure mirrors the original document. Supports invoices, tables, reports, forms, spreadsheet screenshots, and any other structured document image.
+CLI harness: pass an image or PDF, get a `.csv` file whose structure mirrors the original document. Supports invoices, tables, reports, forms, spreadsheet screenshots, and multi-page PDF reports.
 
 ## User preferences
 
