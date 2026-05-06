@@ -109,7 +109,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     lmStudioUrl:     values["lm-studio-url"]    ?? "http://localhost:1234/v1",
     ocrModel:        values["ocr-model"]         ?? "mlx-community/DeepSeek-OCR-8bit",
     dotsOcrModel:    values["dots-ocr-model"]    ?? "mlx-community/dots.ocr-bf16",
-    glmOcrModel:     values["glm-ocr-model"]     ?? "mlx-community/GLM-0CR-bf16",
+    glmOcrModel:     values["glm-ocr-model"]     ?? "mlx-community/GLM-OCR-bf16",
     structurerModel: values["structurer-model"]  ??
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     verbose: values.verbose ?? false,
