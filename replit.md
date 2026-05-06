@@ -1,48 +1,55 @@
-# Document-to-CSV Harness
+# Document-to-CSV / Excel Harness
 
-A typesafe TypeScript CLI that uses DeepSeek-OCR (vision) + Gemma4 (tool use) via LM Studio to extract text from document images and convert them into structured CSV files.
+A typesafe TypeScript CLI that uses DeepSeek-OCR (vision) + Gemma4 (tool use) via LM Studio to extract text from document images and PDFs, then produce structured CSV or Excel files.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/scripts run document-to-csv <file> [options]` — main CLI (image or PDF)
+- `pnpm --filter @workspace/scripts run document-to-csv <file> [options]` — main CLI
+- `pnpm --filter @workspace/scripts run typecheck` — typecheck scripts package
 - `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+
+Key flags:
+- `--excel` — write `.xlsx` instead of `.csv`; embeds rendered PDF pages as image sheets
+- `--verbose` — step-by-step logging
+- `--output <path>` — custom output path
+
+PDF renderer (required for OCR + `--excel` image embedding):
+```
+brew install poppler      # pdftoppm (recommended)
+brew install mupdf-tools  # mutool (fallback)
+```
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
 - LLM client: `openai` SDK (LM Studio OpenAI-compatible endpoint)
+- PDF: `pdfjs-dist` v5 (legacy build via `createRequire`)
+- Image resize: `sharp`
+- Excel output: `exceljs`
+- Validation: Zod (`zod/v4`)
 
 ## Where things live
 
-- `scripts/src/types.ts` — all Zod schemas and TypeScript types
-- `scripts/src/lm-studio-client.ts` — typed OpenAI client factory pointing at LM Studio
-- `scripts/src/ocr.ts` — base64 image encoding + DeepSeek-OCR vision call; returns preprocessed image for Gemma4 visual pass
-- `scripts/src/pdf.ts` — pdfjs-dist text extraction; reconstructs rows by Y-position grouping
-- `scripts/src/csv-generator.ts` — Gemma4 tool-use agentic loop (`write_csv` tool) + RFC 4180 sanitizer
-- `scripts/src/document-to-csv.ts` — CLI entry point; routes by extension (.pdf vs image)
+- `scripts/src/types.ts` — all Zod schemas and TypeScript types (including `CliArgsSchema`)
+- `scripts/src/lm-studio-client.ts` — typed OpenAI client factory
+- `scripts/src/ocr.ts` — `callOcrModel()` + `extractTextWithOcr()`; base64 encoding + DeepSeek-OCR call
+- `scripts/src/pdf.ts` — pdfjs text layer extraction + DeepSeek-OCR pass on rendered pages
+- `scripts/src/csv-generator.ts` — `verifyDocumentWithGemma()` pre-pass + `generateCsvWithGemma()` tool-use loop + RFC 4180 sanitizer
+- `scripts/src/excel-generator.ts` — `generateExcel()`: styled data sheet + per-page image sheets via exceljs
+- `scripts/src/document-to-csv.ts` — CLI entry; routes PDF vs image; orchestrates all steps
 
 ## Architecture decisions
 
-- **LM Studio via OpenAI SDK**: LM Studio exposes an OpenAI-compatible `/v1` endpoint, so the standard `openai` npm package is used directly with a custom `baseURL`. No custom HTTP layer needed.
-- **Two-model pipeline**: DeepSeek-OCR handles vision/extraction (temperature 0, layout-preserving prompt); Gemma4 handles structure inference via tool use (separate concerns, separate models).
-- **Agentic tool-use loop**: The Gemma4 step runs up to 8 iterations. It calls the `write_csv` tool once it has reasoned about the document structure. If it stops without calling the tool it is re-prompted automatically.
-- **Zod for tool argument validation**: Gemma4's `write_csv` tool call arguments are parsed through `WriteCsvToolArgsSchema` before being accepted, ensuring the CSV content is never silently malformed.
-- **Union type narrowing for tool calls**: OpenAI SDK's `ChatCompletionMessageToolCall` is a union; tool calls are narrowed via `type === "function"` guard before accessing `.function.name/.arguments`.
-- **Dual input modes**: images go through DeepSeek-OCR + Gemma4 vision (image forwarded to Gemma4 for column-alignment verification); PDFs go through pdfjs-dist text extraction + Gemma4 text-only (no OCR needed).
-- **pdfjs-dist legacy build via createRequire**: main ESM build requires DOM globals absent in Node.js; loading the legacy CJS build via `createRequire` works in Node.js 22+ which allows `require()` of `.mjs` modules.
+- **LM Studio via OpenAI SDK**: OpenAI-compatible `/v1` endpoint; no custom HTTP layer needed.
+- **Three-model-call PDF pipeline**: (1) DeepSeek-OCR renders+extracts each page visually; (2) Gemma4 `verifyDocumentWithGemma` reconciles page images + pdfjs text + OCR text into one clean tab-delimited text; (3) Gemma4 tool-use loop generates final CSV/Excel.
+- **Agentic tool-use loop**: Gemma4 runs up to 8 iterations calling `write_csv`. Re-prompted automatically if it stops without calling the tool.
+- **Zod for tool argument validation**: `WriteCsvToolArgsSchema` validates every `write_csv` call before accepting it.
+- **pdfjs-dist v5 worker**: `workerSrc` must point to the actual legacy worker file (`_require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")`). Empty string no longer works in v5 — it removed the in-process fake worker.
+- **Excel image embedding**: `exceljs` `addImage()` with `ext: { width, height }` anchored at `tl: { col: 0, row: 0 }`; one worksheet per PDF page.
 
 ## Product
 
-CLI harness: pass an image or PDF, get a `.csv` file whose structure mirrors the original document. Supports invoices, tables, reports, forms, spreadsheet screenshots, and multi-page PDF reports.
+CLI harness: pass an image or PDF, get a structured `.csv` or styled `.xlsx` file. Excel output embeds the original rendered document pages alongside the extracted data table. Supports invoices, tables, reports, forms, spreadsheet screenshots, and multi-page PDFs.
 
 ## User preferences
 
@@ -53,11 +60,12 @@ CLI harness: pass an image or PDF, get a `.csv` file whose structure mirrors the
 
 ## Gotchas
 
-- Both models must be loaded in LM Studio before running the CLI
-- The Gemma4 model must support tool use / function calling — verify in LM Studio that the model template includes tool-use support
-- LM Studio must have the vision model loaded when running OCR; the structurer model can be swapped in or both can be loaded simultaneously if VRAM allows
+- Both models must be loaded in LM Studio before running
+- Gemma4 must support tool use / function calling (verify model template in LM Studio)
+- `pdftoppm` or `mutool` required for PDF page rendering (OCR pass + Excel image embed)
+- pdfjs-dist v5: `workerSrc` must be a real file path, not `""`
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- `pnpm-workspace` skill — workspace structure and TypeScript setup
 - LM Studio docs: https://lm-studio.ai/docs
