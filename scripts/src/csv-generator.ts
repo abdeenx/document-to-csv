@@ -43,40 +43,45 @@ const CSV_TOOL: ChatCompletionTool = {
 
 const SYSTEM_PROMPT = `You are a precise document structure analyst and CSV converter.
 
-You will receive OCR-extracted text from a document image. Produce a well-formed CSV that faithfully represents the data — not the UI chrome around it.
+You will receive an image of a document and its OCR-extracted text. Produce a well-formed CSV that faithfully represents the data.
+
+VISUAL GROUND TRUTH — READ THIS FIRST:
+- The image is the authoritative source. Use it to determine the true column layout and the correct value for every cell.
+- The OCR text is a rough transcription that may have column alignment errors — a value that appears in column N in the OCR may actually belong in column N+1 or N-1 in the real document. Always cross-reference with the image.
+- For every column in the CSV, verify that each row's value is semantically appropriate for that column's header (e.g. a date value must go in a date column, a Yes/No value must go in a toggle column). If the OCR placed a value in the wrong column, move it to the correct one using what you see in the image.
+- Toggle/switch controls: look at the image to determine whether each toggle is ON (colored) or OFF (grey). Output "Yes" for ON and "No" for OFF. Never leave a toggle cell blank.
 
 COLUMN STRUCTURE:
 - Identify the true data columns from the table headers. The number of CSV columns must match the number of logical headers exactly.
-- Multi-word headers that were joined with a space (e.g. "AUTO RENEW") are a single column — do not split them.
+- Multi-word headers joined with a space (e.g. "AUTO RENEW") are a single column — do not split them.
 - UI action elements that appear in every row (e.g. "INFO", "EDIT", "SETUP", "DELETE", "VIEW") are not data columns and must not appear in the header or any row.
 
 DATA ROWS:
 - Each data row maps exactly to one record in the source document.
-- Tooltip text, overlay banners, popup notifications, and modal dialogs visible in the OCR are not data rows — skip them.
-- Toggle values ("Yes"/"No" or "On"/"Off") belong in their column as-is. A column with a toggle header MUST have a value in every row — never blank.
-- Empty cells must still be represented as empty fields (consecutive commas) to keep column counts consistent.
+- Tooltip text, overlay banners, popup notifications, and modal dialogs are not data rows — skip them.
+- Empty cells must still be represented as empty fields to keep column counts consistent.
 
 CSV FORMATTING — CRITICAL:
-- Every field value that contains a comma, a double-quote, or a newline MUST be wrapped in double-quotes.
-- Example: a date like "Apr 29, 2028" contains a comma and MUST be written as "Apr 29, 2028" in the CSV.
-- Escape internal double-quotes by doubling them: He said "hi" → "He said ""hi"""
-- Do NOT rely on the reader to handle unquoted commas inside field values — they will be misinterpreted as column separators.
+- Every field value containing a comma, a double-quote, or a newline MUST be wrapped in double-quotes.
+- Example: "Apr 29, 2028" contains a comma → write it as "Apr 29, 2028" in the CSV.
+- Escape internal double-quotes by doubling them.
 
 QUALITY CHECKS (run before calling write_csv):
-1. Every row has exactly the same number of comma-separated fields as the header row.
+1. Every row has exactly the same number of fields as the header row.
 2. No row contains UI button labels (INFO, EDIT, SETUP, etc.) as field values.
-3. Any field value containing a comma is wrapped in double-quotes.
+3. Any field containing a comma is wrapped in double-quotes.
 4. No tooltip or overlay text appears as a row.
-5. Toggle/boolean columns have a value ("Yes"/"No" or "On"/"Off") in every row — never blank.
+5. Toggle columns have "Yes" or "No" in every row — never blank.
+6. Date values appear in date columns, not in toggle/boolean columns.
 
 GENERAL:
 - For forms/invoices with key-value pairs: use "Field" and "Value" columns.
 - For multi-section documents: add a "Section" column.
 
 Think step-by-step:
-1. Identify the document type and its true data columns (ignoring UI actions).
-2. Determine the exact header row.
-3. Map every data record to a row, filling empty cells with empty strings.
+1. Look at the image to understand the true column layout and visual values (toggles, checkboxes, etc.).
+2. Determine the exact header row from the image, ignoring UI action columns.
+3. For each data row, assign values to columns based on what you see in the image — correct any OCR misalignment.
 4. Run the quality checks above.
 5. Call write_csv exactly once with the final result.`;
 
@@ -207,20 +212,44 @@ export async function generateCsvWithGemma(
     console.log(`[Gemma4] Starting tool-use loop with model: ${modelId}`);
   }
 
+  const ocrTextBlock = [
+    "Here is the OCR-extracted text from the document image.",
+    "Use the image above as visual ground truth — correct any column misalignment you see in the OCR text.",
+    "",
+    "--- BEGIN OCR TEXT ---",
+    ocrResult.rawText,
+    "--- END OCR TEXT ---",
+    "",
+    "Analyze the image and the OCR text together, then call write_csv with the final CSV content.",
+  ].join("\n");
+
+  // Build the first user message. If we have the preprocessed image, send it
+  // alongside the OCR text so Gemma4 can use visual reasoning to verify column
+  // alignment rather than blindly trusting the OCR's positional output.
+  const firstUserContent: ChatCompletionMessageParam["content"] =
+    ocrResult.imageBase64 && ocrResult.imageMimeType
+      ? [
+          {
+            type: "image_url" as const,
+            image_url: {
+              url: `data:${ocrResult.imageMimeType};base64,${ocrResult.imageBase64}`,
+            },
+          },
+          { type: "text" as const, text: ocrTextBlock },
+        ]
+      : ocrTextBlock;
+
+  if (verbose) {
+    console.log(
+      ocrResult.imageBase64
+        ? "[Gemma4] Sending image + OCR text for visual column-alignment verification"
+        : "[Gemma4] No image available — sending OCR text only",
+    );
+  }
+
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    {
-      role: "user",
-      content: [
-        "Here is the OCR-extracted text from the document image. Convert it to a CSV file.",
-        "",
-        "--- BEGIN OCR TEXT ---",
-        ocrResult.rawText,
-        "--- END OCR TEXT ---",
-        "",
-        "Analyze the structure, then call write_csv with the final CSV content.",
-      ].join("\n"),
-    },
+    { role: "user", content: firstUserContent },
   ];
 
   const MAX_ITERATIONS = 8;
