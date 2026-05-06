@@ -27,6 +27,7 @@ export const CliArgsSchema = z.object({
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     ),
   verbose: z.boolean().default(false),
+  excel: z.boolean().default(false),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
