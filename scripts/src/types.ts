@@ -34,10 +34,12 @@ export const OcrResultSchema = z.object({
   rawText: z.string(),
   model: z.string(),
   tokensUsed: z.number().optional(),
-  // Preprocessed image forwarded to the structuring model for visual
-  // column-alignment verification — the OCR text alone loses positional context.
+  // Single image (from image input path) forwarded to Gemma4 for visual verification.
   imageBase64: z.string().optional(),
   imageMimeType: z.string().optional(),
+  // Per-page rendered images (from PDF OCR pass) — one entry per page.
+  // When set, these take priority over imageBase64/imageMimeType in the Gemma4 message.
+  pageImages: z.array(z.object({ base64: z.string(), mimeType: z.string() })).optional(),
 });
 export type OcrResult = z.infer<typeof OcrResultSchema>;
 
