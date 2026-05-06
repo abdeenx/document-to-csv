@@ -34,6 +34,10 @@ export const OcrResultSchema = z.object({
   rawText: z.string(),
   model: z.string(),
   tokensUsed: z.number().optional(),
+  // Preprocessed image forwarded to the structuring model for visual
+  // column-alignment verification — the OCR text alone loses positional context.
+  imageBase64: z.string().optional(),
+  imageMimeType: z.string().optional(),
 });
 export type OcrResult = z.infer<typeof OcrResultSchema>;
 
