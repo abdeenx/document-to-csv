@@ -58,9 +58,9 @@ function isTextItem(item: TextItem | TextMarkedContent): item is TextItem {
   return "str" in item && typeof item.str === "string";
 }
 
-type Renderer = "pdftoppm" | "mutool";
+export type Renderer = "pdftoppm" | "mutool";
 
-async function detectRenderer(): Promise<Renderer | null> {
+export async function detectRenderer(): Promise<Renderer | null> {
   for (const tool of ["pdftoppm", "mutool"] as const) {
     try {
       await execFile("which", [tool], { timeout: 2_000 });
@@ -93,7 +93,7 @@ async function resizeForOcr(
  * Render a single PDF page to a JPEG buffer using a system renderer.
  * Uses a unique prefix per page so there is no ambiguity with padded filenames.
  */
-async function renderPageToJpeg(
+export async function renderPageToJpeg(
   pdfPath: string,
   pageNum: number,
   renderer: Renderer,
@@ -170,15 +170,24 @@ function mulMat6(m1: number[], m2: number[]): number[] {
 }
 
 // ---------------------------------------------------------------------------
-// pdfjs text layer extraction
+// pdfjs text layer extraction — internal shared helper
 // ---------------------------------------------------------------------------
 
 type PdfDoc = Awaited<ReturnType<typeof pdfjsLib.getDocument>["promise"]>;
 
-async function extractPdfjsText(
+/**
+ * Extract per-page text from a pdfjs document.
+ *
+ * @param addPageHeaders  When true, each page text is prefixed with
+ *   "=== PAGE N ===\n" (used in the CSV pipeline where all pages are
+ *   concatenated into one string). When false, returns raw per-page text
+ *   (used in the Word pipeline where pages are processed individually).
+ */
+async function extractPdfjsTextInternal(
   doc: PdfDoc,
   numPages: number,
   verbose: boolean,
+  addPageHeaders: boolean,
 ): Promise<{ pageTexts: string[]; hasAnyText: boolean }> {
   const pageTexts: string[] = [];
   let hasAnyText = false;
@@ -228,7 +237,12 @@ async function extractPdfjsText(
     }
 
     const pageText = rows.map((row) => row.map((c) => c.text).join("\t")).join("\n");
-    pageTexts.push(numPages > 1 ? `=== PAGE ${pageNum} ===\n${pageText}` : pageText);
+
+    if (addPageHeaders) {
+      pageTexts.push(numPages > 1 ? `=== PAGE ${pageNum} ===\n${pageText}` : pageText);
+    } else {
+      pageTexts.push(pageText);
+    }
 
     if (verbose) {
       console.log(`[PDF] Text layer page ${pageNum}: ${rows.length} rows, ${pageText.length} chars`);
@@ -239,7 +253,33 @@ async function extractPdfjsText(
 }
 
 // ---------------------------------------------------------------------------
-// Public entry point
+// Public: per-page raw text (word pipeline — no "=== PAGE N ===" headers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the embedded text layer from a PDF, returning an array of plain
+ * text strings — one per page — with no page-number headers.
+ *
+ * Used by the Word pipeline, which processes pages individually.
+ */
+export async function extractPdfjsPageTextsRaw(
+  pdfPath: string,
+  verbose: boolean,
+): Promise<{ pageTexts: string[]; numPages: number; hasAnyText: boolean }> {
+  if (verbose) console.log(`[PDF] Loading for text extraction: ${pdfPath}`);
+
+  const buffer = await readFile(pdfPath);
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+  const numPages = doc.numPages;
+
+  if (verbose) console.log(`[PDF] ${numPages} page(s) found`);
+
+  const { pageTexts, hasAnyText } = await extractPdfjsTextInternal(doc, numPages, verbose, false);
+  return { pageTexts, numPages, hasAnyText };
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point (CSV/Excel pipeline)
 // ---------------------------------------------------------------------------
 
 /**
@@ -266,7 +306,7 @@ export async function extractTextFromPdf(
   if (verbose) console.log(`[PDF] ${numPages} page(s) found`);
 
   // ── Step 1: pdfjs text layer ──────────────────────────────────────────────
-  const { pageTexts, hasAnyText } = await extractPdfjsText(doc, numPages, verbose);
+  const { pageTexts, hasAnyText } = await extractPdfjsTextInternal(doc, numPages, verbose, true);
 
   if (!hasAnyText) {
     throw new Error(
