@@ -28,6 +28,7 @@ export const CliArgsSchema = z.object({
     ),
   verbose: z.boolean().default(false),
   excel: z.boolean().default(false),
+  word: z.boolean().default(false),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
@@ -100,6 +101,45 @@ export interface PdfPageLayout {
   textItems: PdfTextItem[];
   imageRegions: PdfImageRegion[];
 }
+
+// ---------------------------------------------------------------------------
+// Word output / progress tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-page extraction results from all three sources plus the final
+ * corroborated text that goes into the Word document.
+ */
+export interface PageExtraction {
+  /** Text from the pdfjs embedded text layer. */
+  pdfjsText: string;
+  /** Text from the DeepSeek-OCR visual pass. */
+  ocrText: string;
+  /** Text from the Gemma4 direct vision extraction pass. */
+  gemmaText: string;
+  /** Final corroborated text (reconciled by Gemma4). */
+  corroborated: string;
+}
+
+/**
+ * Progress file written after every completed page so the conversion can
+ * resume from where it left off if interrupted.
+ */
+export const WordProgressSchema = z.object({
+  version: z.literal(1),
+  pdfPath: z.string(),
+  totalPages: z.number().int().positive(),
+  pages: z.record(
+    z.string().regex(/^\d+$/),
+    z.object({
+      pdfjsText: z.string(),
+      ocrText: z.string(),
+      gemmaText: z.string(),
+      corroborated: z.string(),
+    }),
+  ),
+});
+export type WordProgress = z.infer<typeof WordProgressSchema>;
 
 // ---------------------------------------------------------------------------
 
