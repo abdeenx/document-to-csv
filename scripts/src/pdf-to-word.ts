@@ -383,6 +383,8 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
   const tmpDir = join(tmpdir(), `doc2word-${randomUUID()}`);
   await mkdir(tmpDir, { recursive: true });
 
+  const docStart = Date.now();
+
   try {
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const pageKey = String(pageNum);
@@ -394,6 +396,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         continue;
       }
 
+      const pageStart = Date.now();
       console.log(`[Word] Page ${pageNum}/${numPages}:`);
 
       const pdfjsText = pdfjsPageTexts[pageNum - 1] ?? "";
@@ -457,6 +460,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       if (pageImage) {
         try {
           process.stdout.write(`       Corroborating (5 sources)...`);
+          const corrobStart = Date.now();
           corroborated = await corroboratePage(
             client,
             structurerModelId,
@@ -469,7 +473,8 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
             pageImage,
             verbose,
           );
-          process.stdout.write(` done (${corroborated.length} chars)\n`);
+          const corrobSec = ((Date.now() - corrobStart) / 1000).toFixed(1);
+          process.stdout.write(` done (${corroborated.length} chars, ${corrobSec}s)\n`);
         } catch (corrobErr) {
           process.stdout.write(` failed — using best available source\n`);
           console.log(
@@ -494,6 +499,9 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       };
       progress.pages[pageKey] = extraction;
       await saveProgress(progressPath, progress);
+
+      const pageSec = ((Date.now() - pageStart) / 1000).toFixed(1);
+      console.log(`       Page ${pageNum} done in ${pageSec}s`);
     }
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
@@ -503,6 +511,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
 
   // ── Generate Word document ────────────────────────────────────────────────
   console.log("[Word] Generating Word document...");
+  const docGenStart = Date.now();
   const orderedPages = Array.from({ length: numPages }, (_, i) => ({
     pageNum: i + 1,
     text: progress.pages[String(i + 1)]?.corroborated ?? "",
@@ -510,9 +519,16 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
 
   await generateWordDoc(orderedPages, outputPath, verbose);
 
+  const totalSec = ((Date.now() - docStart) / 1000).toFixed(1);
+  const docGenSec = ((Date.now() - docGenStart) / 1000).toFixed(1);
+
   console.log("");
   console.log("Done!");
-  console.log(`  Word document: ${outputPath}`);
-  console.log(`  Progress file: ${progressPath}`);
+  console.log(`  Word document:  ${outputPath}`);
+  console.log(`  Progress file:  ${progressPath}`);
   console.log(`  (Delete the progress file to re-process from scratch next time.)`);
+  console.log("");
+  console.log(`  Timing:`);
+  console.log(`    Document build:  ${docGenSec}s`);
+  console.log(`    Total elapsed:   ${totalSec}s`);
 }
