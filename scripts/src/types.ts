@@ -64,6 +64,45 @@ export const CsvResultSchema = z.object({
 });
 export type CsvResult = z.infer<typeof CsvResultSchema>;
 
+// ---------------------------------------------------------------------------
+// PDF layout types (used for layout-faithful Excel output)
+// ---------------------------------------------------------------------------
+
+/** A single text run extracted from a PDF page via pdfjs getTextContent(). */
+export interface PdfTextItem {
+  /** Left edge in PDF points, from left of page. */
+  x: number;
+  /** Baseline Y in PDF points, from BOTTOM of page (PDF convention). */
+  y: number;
+  str: string;
+  /** Approximate font size in points. */
+  fontSize: number;
+  /** Run width in PDF points. */
+  width: number;
+}
+
+/**
+ * A bounding box for a painted image detected via the PDF operator list.
+ * All coordinates are in PDF points using PDF convention: origin bottom-left.
+ */
+export interface PdfImageRegion {
+  /** Left edge in PDF points from left of page. */
+  x: number;
+  /** Bottom edge in PDF points from bottom of page (PDF coords, not flipped). */
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface PdfPageLayout {
+  pageWidth: number;   // PDF points
+  pageHeight: number;  // PDF points
+  textItems: PdfTextItem[];
+  imageRegions: PdfImageRegion[];
+}
+
+// ---------------------------------------------------------------------------
+
 export const SupportedImageMimeSchema = z.enum([
   "image/jpeg",
   "image/png",
