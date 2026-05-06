@@ -207,6 +207,90 @@ function resolveToolCall(
   return parsed.data;
 }
 
+// ---------------------------------------------------------------------------
+// Visual verification pre-pass (PDF mode)
+// Sends the rendered page images + both extracted text layers to Gemma4 and
+// asks it to produce a single reconciled, tab-delimited text that will then
+// feed into the CSV generation step. This removes positional ambiguity that
+// arises when the PDF text layer and OCR text disagree.
+// ---------------------------------------------------------------------------
+
+const VERIFY_SYSTEM_PROMPT = `You are a document reconciliation assistant.
+
+You will receive:
+1. Rendered page image(s) of a document — treat these as the visual ground truth.
+2. Two extracted text layers: a structural PDF text layer and a visual OCR pass.
+
+Your task: produce a single clean, tab-delimited text representation of all data in the document.
+
+Rules:
+- Use the page image(s) as the authoritative source — correct any column misalignment in the text layers.
+- Within a row, separate columns with a tab character (\\t).
+- Separate rows with newlines.
+- For key-value forms: Key\\tValue per line.
+- For tables: first line is the header row; subsequent lines are data rows.
+- Preserve every distinct value visible in the image — do not merge values unless they are truly a single cell.
+- Output ONLY the reconciled data — no explanation, no commentary, no markdown fences.`;
+
+export async function verifyDocumentWithGemma(
+  client: OpenAI,
+  ocrResult: OcrResult,
+  modelId: string,
+  verbose: boolean,
+): Promise<string> {
+  type ImageUrlBlock = { type: "image_url"; image_url: { url: string } };
+  const imageBlocks: ImageUrlBlock[] = [];
+
+  if (ocrResult.pageImages && ocrResult.pageImages.length > 0) {
+    for (const img of ocrResult.pageImages) {
+      imageBlocks.push({
+        type: "image_url",
+        image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+      });
+    }
+  }
+
+  const textBody = [
+    "=== PDF TEXT LAYER ===",
+    ocrResult.rawText,
+    "",
+    "Reconcile the image(s) above with this extracted text and output the verified, tab-delimited document data.",
+  ].join("\n");
+
+  const userContent: ChatCompletionMessageParam["content"] =
+    imageBlocks.length > 0
+      ? [...imageBlocks, { type: "text" as const, text: textBody }]
+      : textBody;
+
+  if (verbose) {
+    console.log(
+      `[Gemma4-Verify] Sending ${imageBlocks.length} image(s) + text for reconciliation...`,
+    );
+  }
+
+  const response = await client.chat.completions.create({
+    model: modelId,
+    messages: [
+      { role: "system", content: VERIFY_SYSTEM_PROMPT },
+      { role: "user", content: userContent },
+    ],
+    max_tokens: 4096,
+    temperature: 0.05,
+  });
+
+  const verified = response.choices[0]?.message.content?.trim() ?? "";
+  if (verbose) {
+    console.log(`[Gemma4-Verify] Reconciled text (${verified.length} chars):`);
+    console.log(verified);
+    console.log("");
+  }
+
+  // Fall back to the original rawText if the model returned nothing useful
+  return verified.length > 20 ? verified : ocrResult.rawText;
+}
+
+// ---------------------------------------------------------------------------
+
 export async function generateCsvWithGemma(
   client: OpenAI,
   ocrResult: OcrResult,
