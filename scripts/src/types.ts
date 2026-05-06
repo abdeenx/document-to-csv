@@ -22,7 +22,7 @@ export const CliArgsSchema = z.object({
   lmStudioUrl: z.string().url().default("http://localhost:1234/v1"),
   ocrModel: z.string().default("mlx-community/DeepSeek-OCR-8bit"),
   dotsOcrModel: z.string().default("mlx-community/dots.ocr-bf16"),
-  glmOcrModel: z.string().default("mlx-community/GLM-0CR-bf16"),
+  glmOcrModel: z.string().default("mlx-community/GLM-OCR-bf16"),
   structurerModel: z
     .string()
     .default(
