@@ -73,15 +73,21 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "You are a document accuracy expert specializing in Arabic and Latin text.",
   "You will receive:",
   "  1. A rendered image of a PDF page (use this as the visual ground truth).",
-  "  2. Three independently extracted text versions of that page.",
+  "  2. Five independently extracted text versions of that page:",
+  "       Source 1 — PDF text layer (pdfjs, structural/positional)",
+  "       Source 2 — DeepSeek-OCR (visual OCR model)",
+  "       Source 3 — dots.ocr (visual OCR model)",
+  "       Source 4 — GLM-OCR (visual OCR model)",
+  "       Source 5 — Gemma4 vision (AI visual reading)",
   "",
   "Your task: produce a single, maximally accurate version of the page's text content.",
   "",
   "RECONCILIATION RULES:",
   "- Use the page image to visually verify text when sources disagree.",
-  "- Content appearing in 2 or 3 sources is likely correct — include it.",
-  "- Content in only 1 source: include it only if the page image confirms it.",
-  "- If all three sources are wrong on something, correct it using the image.",
+  "- Content appearing in 3 or more sources is almost certainly correct — include it.",
+  "- Content in 2 sources: include if the page image does not contradict it.",
+  "- Content in only 1 source: include only if the page image clearly confirms it.",
+  "- If all five sources are wrong on something, correct it using the image.",
   "",
   "LANGUAGE:",
   "- Arabic text: preserve every Arabic word exactly. Maintain RTL character order within words.",
@@ -240,12 +246,14 @@ async function corroboratePage(
   pageNum: number,
   pdfjsText: string,
   ocrText: string,
+  dotsOcrText: string,
+  glmOcrText: string,
   gemmaText: string,
   pageImage: { base64: string; mimeType: string },
   verbose: boolean,
 ): Promise<string> {
   if (verbose) {
-    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 3 sources...`);
+    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 5 sources...`);
   }
 
   const textBody = [
@@ -253,9 +261,15 @@ async function corroboratePage(
     pdfjsText || "(no text extracted from text layer)",
     ``,
     `=== SOURCE 2: DEEPSEEK-OCR EXTRACTION (visual OCR) ===`,
-    ocrText || "(no text extracted by OCR)",
+    ocrText || "(no text extracted by DeepSeek-OCR)",
     ``,
-    `=== SOURCE 3: GEMMA4 VISION EXTRACTION (AI visual reading) ===`,
+    `=== SOURCE 3: DOTS.OCR EXTRACTION (visual OCR) ===`,
+    dotsOcrText || "(no text extracted by dots.ocr)",
+    ``,
+    `=== SOURCE 4: GLM-OCR EXTRACTION (visual OCR) ===`,
+    glmOcrText || "(no text extracted by GLM-OCR)",
+    ``,
+    `=== SOURCE 5: GEMMA4 VISION EXTRACTION (AI visual reading) ===`,
     gemmaText || "(no text extracted by Gemma4)",
     ``,
     `Using the page image above as visual ground truth, produce the single most accurate version of this page's text.`,
@@ -304,6 +318,8 @@ export interface ConvertPdfToWordArgs {
   progressPath: string;
   client: OpenAI;
   ocrModelId: string;
+  dotsOcrModelId: string;
+  glmOcrModelId: string;
   structurerModelId: string;
   verbose: boolean;
 }
@@ -322,6 +338,8 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
     progressPath,
     client,
     ocrModelId,
+    dotsOcrModelId,
+    glmOcrModelId,
     structurerModelId,
     verbose,
   } = args;
@@ -395,60 +413,67 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         }
       }
 
-      // ── Pass 2: DeepSeek-OCR ──────────────────────────────────────────────
+      // ── Passes 2–5: All four model extractions run in parallel ────────────
+      // DeepSeek-OCR, dots.ocr, GLM-OCR, and Gemma4-direct are independent
+      // of each other, so we fire them all at once and wait for all results.
       let ocrText = "";
-      if (pageImage) {
-        try {
-          process.stdout.write(`       DeepSeek-OCR...`);
-          ocrText = await callOcrModel(
-            client,
-            pageImage.base64,
-            pageImage.mimeType,
-            ocrModelId,
-            verbose,
-            OCR_SYSTEM_PROMPT_WORD,
-          );
-          process.stdout.write(` done (${ocrText.length} chars)\n`);
-        } catch (ocrErr) {
-          process.stdout.write(` failed\n`);
-          console.log(
-            `       OCR error: ${ocrErr instanceof Error ? ocrErr.message : String(ocrErr)}`,
-          );
-        }
-      }
-
-      // ── Pass 3: Gemma4 direct extraction ──────────────────────────────────
+      let dotsOcrText = "";
+      let glmOcrText = "";
       let gemmaText = "";
+
       if (pageImage) {
-        try {
-          process.stdout.write(`       Gemma4 extraction...`);
-          gemmaText = await extractWithGemma4(
-            client,
-            structurerModelId,
-            pageImage,
-            pageNum,
-            verbose,
-          );
-          process.stdout.write(` done (${gemmaText.length} chars)\n`);
-        } catch (gemmaErr) {
-          process.stdout.write(` failed\n`);
-          console.log(
-            `       Gemma4 error: ${gemmaErr instanceof Error ? gemmaErr.message : String(gemmaErr)}`,
-          );
+        process.stdout.write(`       Extracting (4 models in parallel)...`);
+
+        const [ocrResult, dotsResult, glmResult, gemmaResult] =
+          await Promise.allSettled([
+            callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD),
+            callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD),
+            callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,  verbose, OCR_SYSTEM_PROMPT_WORD),
+            extractWithGemma4(client, structurerModelId, pageImage, pageNum, verbose),
+          ]);
+
+        if (ocrResult.status === "fulfilled") {
+          ocrText = ocrResult.value;
+        } else {
+          console.log(`\n       DeepSeek-OCR error: ${ocrResult.reason instanceof Error ? ocrResult.reason.message : String(ocrResult.reason)}`);
         }
+
+        if (dotsResult.status === "fulfilled") {
+          dotsOcrText = dotsResult.value;
+        } else {
+          console.log(`\n       dots.ocr error: ${dotsResult.reason instanceof Error ? dotsResult.reason.message : String(dotsResult.reason)}`);
+        }
+
+        if (glmResult.status === "fulfilled") {
+          glmOcrText = glmResult.value;
+        } else {
+          console.log(`\n       GLM-OCR error: ${glmResult.reason instanceof Error ? glmResult.reason.message : String(glmResult.reason)}`);
+        }
+
+        if (gemmaResult.status === "fulfilled") {
+          gemmaText = gemmaResult.value;
+        } else {
+          console.log(`\n       Gemma4 error: ${gemmaResult.reason instanceof Error ? gemmaResult.reason.message : String(gemmaResult.reason)}`);
+        }
+
+        process.stdout.write(
+          ` done  deepseek:${ocrText.length}  dots:${dotsOcrText.length}  glm:${glmOcrText.length}  gemma:${gemmaText.length} chars\n`,
+        );
       }
 
-      // ── Pass 4: Corroboration ─────────────────────────────────────────────
+      // ── Pass 6: Corroboration ─────────────────────────────────────────────
       let corroborated: string;
       if (pageImage) {
         try {
-          process.stdout.write(`       Corroborating...`);
+          process.stdout.write(`       Corroborating (5 sources)...`);
           corroborated = await corroboratePage(
             client,
             structurerModelId,
             pageNum,
             pdfjsText,
             ocrText,
+            dotsOcrText,
+            glmOcrText,
             gemmaText,
             pageImage,
             verbose,
@@ -459,7 +484,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           console.log(
             `       Corroboration error: ${corrobErr instanceof Error ? corrobErr.message : String(corrobErr)}`,
           );
-          corroborated = gemmaText || ocrText || pdfjsText;
+          corroborated = gemmaText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
         }
       } else {
         // No image available — fall back to the pdfjs text layer only
@@ -471,6 +496,8 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       const extraction: PageExtraction = {
         pdfjsText,
         ocrText,
+        dotsOcrText,
+        glmOcrText,
         gemmaText,
         corroborated,
       };
