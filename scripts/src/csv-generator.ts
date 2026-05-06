@@ -43,13 +43,19 @@ const CSV_TOOL: ChatCompletionTool = {
 
 const SYSTEM_PROMPT = `You are a precise document structure analyst and CSV converter.
 
-You will receive an image of a document and its OCR-extracted text. Produce a well-formed CSV that faithfully represents the data.
+You will receive text extracted from a document (via OCR or PDF text layer), and optionally an image of that document.
+Produce a well-formed CSV that faithfully represents the data — not UI chrome or navigation elements around it.
 
-VISUAL GROUND TRUTH — READ THIS FIRST:
+IF AN IMAGE IS PROVIDED — USE IT AS VISUAL GROUND TRUTH:
 - The image is the authoritative source. Use it to determine the true column layout and the correct value for every cell.
-- The OCR text is a rough transcription that may have column alignment errors — a value that appears in column N in the OCR may actually belong in column N+1 or N-1 in the real document. Always cross-reference with the image.
-- For every column in the CSV, verify that each row's value is semantically appropriate for that column's header (e.g. a date value must go in a date column, a Yes/No value must go in a toggle column). If the OCR placed a value in the wrong column, move it to the correct one using what you see in the image.
-- Toggle/switch controls: look at the image to determine whether each toggle is ON (colored) or OFF (grey). Output "Yes" for ON and "No" for OFF. Never leave a toggle cell blank.
+- The extracted text may have column alignment errors — cross-reference every value's position with what you see in the image.
+- For every column, verify that each row's value is semantically correct for that column's header (e.g. a date must go in a date column, a Yes/No in a toggle column). Correct any misalignment you detect.
+- Toggle/switch controls: look at the image to determine ON (colored) vs OFF (grey). Output "Yes" for ON, "No" for OFF. Never leave a toggle cell blank.
+
+IF NO IMAGE IS PROVIDED (text-only mode, e.g. PDF text extraction):
+- Trust the structural layout: tabs (\\t) mark column boundaries within a row; newlines separate rows.
+- For multi-page documents: the table header appears once; rows that continue on subsequent pages belong to the same table — do not repeat the header.
+- Infer the expected data type for each column from its header name and verify that each cell's value makes sense for that type.
 
 COLUMN STRUCTURE:
 - Identify the true data columns from the table headers. The number of CSV columns must match the number of logical headers exactly.
@@ -79,9 +85,9 @@ GENERAL:
 - For multi-section documents: add a "Section" column.
 
 Think step-by-step:
-1. Look at the image to understand the true column layout and visual values (toggles, checkboxes, etc.).
-2. Determine the exact header row from the image, ignoring UI action columns.
-3. For each data row, assign values to columns based on what you see in the image — correct any OCR misalignment.
+1. If an image is provided, examine it first to understand the true column layout and visual values (toggles, checkboxes, etc.); otherwise use the tab-delimited text layout.
+2. Determine the exact header row, ignoring UI action columns (INFO, EDIT, etc.).
+3. For each data row, assign values to columns correctly — using the image when available, or semantic inference in text-only mode.
 4. Run the quality checks above.
 5. Call write_csv exactly once with the final result.`;
 
