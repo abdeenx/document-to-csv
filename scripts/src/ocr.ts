@@ -161,5 +161,9 @@ export async function extractTextWithOcr(
     rawText,
     model: modelId,
     tokensUsed: response.usage?.total_tokens,
+    // Pass the preprocessed image to the structuring step so Gemma4 can use
+    // visual reasoning to verify and correct OCR column alignment.
+    imageBase64: result.base64,
+    imageMimeType: result.mimeType,
   };
 }
