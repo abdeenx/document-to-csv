@@ -45,11 +45,14 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
 
   const imagePath = positionals[0]!;
   const imageBase = basename(imagePath, extname(imagePath));
-  const defaultOutput = resolve(process.cwd(), `${imageBase}.csv`);
+  // INIT_CWD is set by pnpm/npm to the directory where the user ran the command,
+  // regardless of which package directory the script executes from.
+  const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
+  const defaultOutput = resolve(callerCwd, `${imageBase}.csv`);
 
   const raw = {
-    imagePath: resolve(imagePath),
-    outputPath: values.output ? resolve(values.output) : defaultOutput,
+    imagePath: resolve(callerCwd, imagePath),
+    outputPath: values.output ? resolve(callerCwd, values.output) : defaultOutput,
     lmStudioUrl: values["lm-studio-url"] ?? "http://localhost:1234/v1",
     ocrModel: values["ocr-model"] ?? "mlx-community/DeepSeek-OCR-8bit",
     structurerModel:
