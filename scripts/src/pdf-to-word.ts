@@ -422,43 +422,34 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       let gemmaText = "";
 
       if (pageImage) {
-        process.stdout.write(`       Extracting (4 models in parallel)...`);
+        // Print a header line, then each model prints its own result line the
+        // instant it finishes — output appears in completion order, not start order.
+        console.log(`       Extracting (4 models in parallel):`);
+        const t0 = Date.now();
 
-        const [ocrResult, dotsResult, glmResult, gemmaResult] =
-          await Promise.allSettled([
-            callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD),
-            callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD),
-            callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,  verbose, OCR_SYSTEM_PROMPT_WORD),
-            extractWithGemma4(client, structurerModelId, pageImage, pageNum, verbose),
-          ]);
-
-        if (ocrResult.status === "fulfilled") {
-          ocrText = ocrResult.value;
-        } else {
-          console.log(`\n       DeepSeek-OCR error: ${ocrResult.reason instanceof Error ? ocrResult.reason.message : String(ocrResult.reason)}`);
+        function liveModel(label: string, p: Promise<string>): Promise<string> {
+          const pad = label.padEnd(16);
+          return p.then(
+            (text) => {
+              const s = ((Date.now() - t0) / 1000).toFixed(1);
+              process.stdout.write(`         ✓ ${pad} ${text.length} chars  (${s}s)\n`);
+              return text;
+            },
+            (err: unknown) => {
+              const s = ((Date.now() - t0) / 1000).toFixed(1);
+              const msg = err instanceof Error ? err.message.slice(0, 100) : String(err);
+              process.stdout.write(`         ✗ ${pad} error: ${msg}  (${s}s)\n`);
+              return "";
+            },
+          );
         }
 
-        if (dotsResult.status === "fulfilled") {
-          dotsOcrText = dotsResult.value;
-        } else {
-          console.log(`\n       dots.ocr error: ${dotsResult.reason instanceof Error ? dotsResult.reason.message : String(dotsResult.reason)}`);
-        }
-
-        if (glmResult.status === "fulfilled") {
-          glmOcrText = glmResult.value;
-        } else {
-          console.log(`\n       GLM-OCR error: ${glmResult.reason instanceof Error ? glmResult.reason.message : String(glmResult.reason)}`);
-        }
-
-        if (gemmaResult.status === "fulfilled") {
-          gemmaText = gemmaResult.value;
-        } else {
-          console.log(`\n       Gemma4 error: ${gemmaResult.reason instanceof Error ? gemmaResult.reason.message : String(gemmaResult.reason)}`);
-        }
-
-        process.stdout.write(
-          ` done  deepseek:${ocrText.length}  dots:${dotsOcrText.length}  glm:${glmOcrText.length}  gemma:${gemmaText.length} chars\n`,
-        );
+        [ocrText, dotsOcrText, glmOcrText, gemmaText] = await Promise.all([
+          liveModel("DeepSeek-OCR", callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("dots.ocr",     callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("GLM-OCR",      callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,  verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("Gemma4",       extractWithGemma4(client, structurerModelId, pageImage, pageNum, verbose)),
+        ]);
       }
 
       // ── Pass 6: Corroboration ─────────────────────────────────────────────
