@@ -40,7 +40,12 @@ const _require = createRequire(import.meta.url);
 const pdfjsLib = _require(
   "pdfjs-dist/legacy/build/pdf.mjs",
 ) as typeof PdfJsLib;
-pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+
+// pdfjs-dist v5 removed the in-process "fake worker" — workerSrc must point
+// to the actual worker file. Node.js spawns it via worker_threads.
+pdfjsLib.GlobalWorkerOptions.workerSrc = _require.resolve(
+  "pdfjs-dist/legacy/build/pdf.worker.mjs",
+);
 
 const MAX_DIMENSION = 1600;
 const RENDER_TIMEOUT_MS = 60_000;
