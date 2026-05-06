@@ -12,10 +12,10 @@ import { buildDataUrl } from "./lm-studio-client.js";
 const MAX_DIMENSION = 1600;
 
 // ---------------------------------------------------------------------------
-// Shared OCR system prompt (used by both image and PDF OCR passes)
+// Shared OCR system prompt — CSV / structured-data mode
 // ---------------------------------------------------------------------------
 
-const OCR_SYSTEM_PROMPT = [
+export const OCR_SYSTEM_PROMPT_CSV = [
   "You are a precise OCR engine for structured documents.",
   "Extract every piece of text visible in the image. Follow these rules exactly:",
   "",
@@ -39,12 +39,41 @@ const OCR_SYSTEM_PROMPT = [
 ].join("\n");
 
 // ---------------------------------------------------------------------------
+// OCR system prompt — document / word mode
+// Used when extracting text for Word output (preserves headings, paragraphs).
+// ---------------------------------------------------------------------------
+
+export const OCR_SYSTEM_PROMPT_WORD = [
+  "You are a precise OCR engine for document text extraction.",
+  "Extract all text from the image exactly as it appears, preserving the document's structure.",
+  "",
+  "STRUCTURE RULES:",
+  "- Headings and titles: place on their own line, preceded and followed by a blank line.",
+  "- Body paragraphs: separate with blank lines.",
+  "- Tables and grids: use tab characters (\\t) between columns, newlines between rows. Include the header row.",
+  "- Lists (numbered or bulleted): preserve list markers (1., 2., •, -, etc.) and indentation.",
+  "- Key-value pairs: Key: Value, one per line.",
+  "",
+  "LANGUAGE:",
+  "- Preserve Arabic text exactly as it appears. Maintain the correct right-to-left character order.",
+  "- Preserve Latin text, numbers, punctuation, and symbols exactly as shown.",
+  "- Do not translate, transliterate, or mix scripts.",
+  "",
+  "OUTPUT:",
+  "- Raw extracted text only. No commentary, no summaries, no markdown code fences.",
+  "- Preserve blank lines that reflect the document's logical paragraph and section structure.",
+].join("\n");
+
+// ---------------------------------------------------------------------------
 // Core OCR API call — shared by image and PDF paths
 // ---------------------------------------------------------------------------
 
 /**
  * Send a pre-encoded image to the OCR model and return the extracted text.
  * Callers are responsible for resizing the image before calling this function.
+ *
+ * @param systemPromptOverride  When provided, replaces the default CSV-oriented
+ *   system prompt (e.g. pass OCR_SYSTEM_PROMPT_WORD for document extraction).
  */
 export async function callOcrModel(
   client: OpenAI,
@@ -52,6 +81,7 @@ export async function callOcrModel(
   mimeType: string,
   modelId: string,
   verbose: boolean,
+  systemPromptOverride?: string,
 ): Promise<string> {
   if (verbose) {
     console.log(
@@ -60,11 +90,12 @@ export async function callOcrModel(
   }
 
   const dataUrl = buildDataUrl(base64, mimeType);
+  const systemPrompt = systemPromptOverride ?? OCR_SYSTEM_PROMPT_CSV;
 
   const response = await client.chat.completions.create({
     model: modelId,
     messages: [
-      { role: "system", content: OCR_SYSTEM_PROMPT },
+      { role: "system", content: systemPrompt },
       {
         role: "user",
         content: [
