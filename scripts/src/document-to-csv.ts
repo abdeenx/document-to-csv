@@ -61,6 +61,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       word:               { type: "boolean", default: false },
       "lm-studio-url":    { type: "string" },
       "ocr-model":        { type: "string" },
+      "dots-ocr-model":   { type: "string" },
+      "glm-ocr-model":    { type: "string" },
       "structurer-model": { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
@@ -106,6 +108,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     outputPath:      values.output ? resolve(callerCwd, values.output) : defaultOutput,
     lmStudioUrl:     values["lm-studio-url"]    ?? "http://localhost:1234/v1",
     ocrModel:        values["ocr-model"]         ?? "mlx-community/DeepSeek-OCR-8bit",
+    dotsOcrModel:    values["dots-ocr-model"]    ?? "mlx-community/dots.ocr-bf16",
+    glmOcrModel:     values["glm-ocr-model"]     ?? "mlx-community/GLM-0CR-bf16",
     structurerModel: values["structurer-model"]  ??
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     verbose: values.verbose ?? false,
@@ -185,24 +189,28 @@ async function main(): Promise<void> {
 
     console.log("document-to-csv (PDF → Word mode)");
     console.log("==================================");
-    console.log(`  Input:         ${args.imagePath}`);
-    console.log(`  Output:        ${args.outputPath}`);
-    console.log(`  Progress file: ${progressPath}`);
-    console.log(`  OCR model:     ${args.ocrModel}`);
-    console.log(`  Struct model:  ${args.structurerModel}`);
-    console.log(`  LM Studio:     ${args.lmStudioUrl}`);
+    console.log(`  Input:          ${args.imagePath}`);
+    console.log(`  Output:         ${args.outputPath}`);
+    console.log(`  Progress file:  ${progressPath}`);
+    console.log(`  DeepSeek-OCR:   ${args.ocrModel}`);
+    console.log(`  dots.ocr:       ${args.dotsOcrModel}`);
+    console.log(`  GLM-OCR:        ${args.glmOcrModel}`);
+    console.log(`  Struct model:   ${args.structurerModel}`);
+    console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
     const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
 
     await convertPdfToWord({
-      pdfPath:          args.imagePath,
-      outputPath:       args.outputPath!,
+      pdfPath:           args.imagePath,
+      outputPath:        args.outputPath!,
       progressPath,
       client,
-      ocrModelId:       args.ocrModel,
+      ocrModelId:        args.ocrModel,
+      dotsOcrModelId:    args.dotsOcrModel,
+      glmOcrModelId:     args.glmOcrModel,
       structurerModelId: args.structurerModel,
-      verbose:          args.verbose,
+      verbose:           args.verbose,
     });
 
     return;
