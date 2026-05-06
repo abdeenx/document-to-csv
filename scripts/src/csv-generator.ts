@@ -218,39 +218,64 @@ export async function generateCsvWithGemma(
     console.log(`[Gemma4] Starting tool-use loop with model: ${modelId}`);
   }
 
+  // Collect image blocks — pageImages (multi-page PDF) takes priority over the
+  // single imageBase64 (image file path). Either way, images go first in the
+  // content array so the model sees them as "the document above".
+  type ImageUrlBlock = { type: "image_url"; image_url: { url: string } };
+  const imageBlocks: ImageUrlBlock[] = [];
+
+  if (ocrResult.pageImages && ocrResult.pageImages.length > 0) {
+    for (const img of ocrResult.pageImages) {
+      imageBlocks.push({
+        type: "image_url",
+        image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+      });
+    }
+  } else if (ocrResult.imageBase64 && ocrResult.imageMimeType) {
+    imageBlocks.push({
+      type: "image_url",
+      image_url: {
+        url: `data:${ocrResult.imageMimeType};base64,${ocrResult.imageBase64}`,
+      },
+    });
+  }
+
+  const hasImages = imageBlocks.length > 0;
+
+  // Tailor the preamble to what's actually available.
+  let preamble: string;
+  if (ocrResult.pageImages && ocrResult.pageImages.length > 0) {
+    preamble =
+      `The ${ocrResult.pageImages.length} rendered page image(s) above are the visual ground truth. ` +
+      "The extracted text below comes from two sources: a structural PDF text layer and a visual OCR pass. " +
+      "Cross-reference all three (images, PDF text, OCR text) to produce the most accurate CSV.";
+  } else if (hasImages) {
+    preamble =
+      "The document image above is the visual ground truth. " +
+      "Cross-reference it with the OCR text below — correct any column misalignment you detect.";
+  } else {
+    preamble =
+      "No image is available. Use the structural text layout " +
+      "(tabs mark column boundaries, newlines separate rows) to produce the CSV.";
+  }
+
   const ocrTextBlock = [
-    "Here is the OCR-extracted text from the document image.",
-    "Use the image above as visual ground truth — correct any column misalignment you see in the OCR text.",
+    preamble,
     "",
-    "--- BEGIN OCR TEXT ---",
+    "--- BEGIN EXTRACTED TEXT ---",
     ocrResult.rawText,
-    "--- END OCR TEXT ---",
+    "--- END EXTRACTED TEXT ---",
     "",
-    "Analyze the image and the OCR text together, then call write_csv with the final CSV content.",
+    "Analyze the content, then call write_csv with the final CSV content.",
   ].join("\n");
 
-  // Build the first user message. If we have the preprocessed image, send it
-  // alongside the OCR text so Gemma4 can use visual reasoning to verify column
-  // alignment rather than blindly trusting the OCR's positional output.
-  const firstUserContent: ChatCompletionMessageParam["content"] =
-    ocrResult.imageBase64 && ocrResult.imageMimeType
-      ? [
-          {
-            type: "image_url" as const,
-            image_url: {
-              url: `data:${ocrResult.imageMimeType};base64,${ocrResult.imageBase64}`,
-            },
-          },
-          { type: "text" as const, text: ocrTextBlock },
-        ]
-      : ocrTextBlock;
+  const firstUserContent: ChatCompletionMessageParam["content"] = hasImages
+    ? [...imageBlocks, { type: "text" as const, text: ocrTextBlock }]
+    : ocrTextBlock;
 
   if (verbose) {
-    console.log(
-      ocrResult.imageBase64
-        ? "[Gemma4] Sending image + OCR text for visual column-alignment verification"
-        : "[Gemma4] No image available — sending OCR text only",
-    );
+    const imgDesc = hasImages ? `${imageBlocks.length} image(s) + text` : "text only";
+    console.log(`[Gemma4] Sending ${imgDesc} for CSV generation`);
   }
 
   const messages: ChatCompletionMessageParam[] = [
