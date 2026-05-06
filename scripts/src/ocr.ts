@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import type OpenAI from "openai";
+import sharp from "sharp";
 import {
   IMAGE_EXTENSION_TO_MIME,
   type OcrResult,
@@ -8,9 +9,16 @@ import {
 } from "./types.js";
 import { buildDataUrl } from "./lm-studio-client.js";
 
-async function encodeImageToBase64(imagePath: string): Promise<{
+const MAX_DIMENSION = 1600;
+
+async function loadAndPreprocess(imagePath: string): Promise<{
   base64: string;
   mimeType: SupportedImageMime;
+  originalWidth: number;
+  originalHeight: number;
+  finalWidth: number;
+  finalHeight: number;
+  resized: boolean;
 }> {
   const ext = extname(imagePath).slice(1).toLowerCase();
   const mimeType = IMAGE_EXTENSION_TO_MIME[ext];
@@ -22,9 +30,44 @@ async function encodeImageToBase64(imagePath: string): Promise<{
   }
 
   const imageBuffer = await readFile(imagePath);
-  const base64 = imageBuffer.toString("base64");
+  const metadata = await sharp(imageBuffer).metadata();
+  const originalWidth = metadata.width ?? 0;
+  const originalHeight = metadata.height ?? 0;
 
-  return { base64, mimeType };
+  const needsResize =
+    originalWidth > MAX_DIMENSION || originalHeight > MAX_DIMENSION;
+
+  if (!needsResize) {
+    return {
+      base64: imageBuffer.toString("base64"),
+      mimeType,
+      originalWidth,
+      originalHeight,
+      finalWidth: originalWidth,
+      finalHeight: originalHeight,
+      resized: false,
+    };
+  }
+
+  const resizedBuffer = await sharp(imageBuffer)
+    .resize(MAX_DIMENSION, MAX_DIMENSION, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality: 92 })
+    .toBuffer();
+
+  const resizedMeta = await sharp(resizedBuffer).metadata();
+
+  return {
+    base64: resizedBuffer.toString("base64"),
+    mimeType: "image/jpeg",
+    originalWidth,
+    originalHeight,
+    finalWidth: resizedMeta.width ?? 0,
+    finalHeight: resizedMeta.height ?? 0,
+    resized: true,
+  };
 }
 
 export async function extractTextWithOcr(
@@ -34,17 +77,27 @@ export async function extractTextWithOcr(
   verbose: boolean,
 ): Promise<OcrResult> {
   if (verbose) {
-    console.log(`[OCR] Encoding image: ${imagePath}`);
+    console.log(`[OCR] Loading image: ${imagePath}`);
   }
 
-  const { base64, mimeType } = await encodeImageToBase64(imagePath);
-  const dataUrl = buildDataUrl(base64, mimeType);
+  const result = await loadAndPreprocess(imagePath);
 
   if (verbose) {
+    if (result.resized) {
+      console.log(
+        `[OCR] Resized ${result.originalWidth}×${result.originalHeight} → ${result.finalWidth}×${result.finalHeight} (JPEG q92)`,
+      );
+    } else {
+      console.log(
+        `[OCR] Image is ${result.originalWidth}×${result.originalHeight} — no resize needed`,
+      );
+    }
     console.log(
-      `[OCR] Image encoded (${Math.round(base64.length * 0.75 / 1024)} KB). Sending to ${modelId}...`,
+      `[OCR] Encoded size: ${Math.round((result.base64.length * 0.75) / 1024)} KB. Sending to ${modelId}...`,
     );
   }
+
+  const dataUrl = buildDataUrl(result.base64, result.mimeType);
 
   const response = await client.chat.completions.create({
     model: modelId,
