@@ -134,8 +134,11 @@ async function main(): Promise<void> {
   console.log("================");
   console.log(`  Input:        ${args.imagePath}`);
   console.log(`  Output:       ${args.outputPath}`);
-  console.log(`  Mode:         ${isPdf ? "PDF (pdfjs text extraction)" : "Image (DeepSeek-OCR)"}`);
-  if (!isPdf) {
+  if (isPdf) {
+    console.log(`  Mode:         PDF  →  pdfjs text layer + DeepSeek-OCR on rendered pages`);
+    console.log(`  OCR model:    ${args.ocrModel}  (requires pdftoppm or mutool — see --help)`);
+  } else {
+    console.log(`  Mode:         Image  →  DeepSeek-OCR`);
     console.log(`  OCR model:    ${args.ocrModel}`);
   }
   console.log(`  Struct model: ${args.structurerModel}`);
@@ -156,7 +159,7 @@ async function main(): Promise<void> {
   console.log(step1Label);
 
   const ocrResult = isPdf
-    ? await extractTextFromPdf(args.imagePath, args.verbose)
+    ? await extractTextFromPdf(args.imagePath, args.verbose, client, args.ocrModel)
     : await extractTextWithOcr(client, args.imagePath, args.ocrModel, args.verbose);
 
   if (args.verbose) {
