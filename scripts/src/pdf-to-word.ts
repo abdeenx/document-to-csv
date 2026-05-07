@@ -46,39 +46,15 @@ import { generateWordDoc } from "./word-generator.js";
 // Prompts
 // ---------------------------------------------------------------------------
 
-const GEMMA_EXTRACT_SYSTEM_PROMPT = [
-  "You are a multimodal document reader with high accuracy for both Arabic and Latin text.",
-  "Look at the document page image provided and extract all visible text.",
-  "",
-  "STRUCTURE RULES:",
-  "- Headings and titles: place on their own line, with a blank line before and after.",
-  "- Body paragraphs: separate with blank lines.",
-  "- Tables: use tab characters (\\t) between columns, newlines between rows.",
-  "  Include the header row. Do not skip any column.",
-  "- Numbered or bulleted lists: preserve list markers (1., 2., •, -, etc.).",
-  "- Key-value pairs: Key: Value, one per line.",
-  "",
-  "LANGUAGE:",
-  "- Arabic text: output each Arabic word or phrase exactly as it appears.",
-  "  Maintain the correct reading direction for each word (right-to-left within words).",
-  "- Latin text, numbers, symbols: output exactly as shown.",
-  "- Do not translate or transliterate any text.",
-  "",
-  "OUTPUT:",
-  "- Only the extracted text. No commentary, no explanations, no markdown fences.",
-  "- Preserve blank lines that reflect the document's paragraph and section structure.",
-].join("\n");
-
 const CORROBORATE_SYSTEM_PROMPT = [
   "You are a document accuracy expert specializing in Arabic and Latin text.",
   "You will receive:",
   "  1. A rendered image of a PDF page (use this as the visual ground truth).",
-  "  2. Five independently extracted text versions of that page:",
+  "  2. Four independently extracted text versions of that page:",
   "       Source 1 — PDF text layer (pdfjs, structural/positional)",
   "       Source 2 — DeepSeek-OCR (visual OCR model)",
   "       Source 3 — dots.ocr (visual OCR model)",
   "       Source 4 — GLM-OCR (visual OCR model)",
-  "       Source 5 — Gemma4 vision (AI visual reading)",
   "",
   "Your task: produce a single, maximally accurate version of the page's text content.",
   "",
@@ -87,7 +63,7 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "- Content appearing in 3 or more sources is almost certainly correct — include it.",
   "- Content in 2 sources: include if the page image does not contradict it.",
   "- Content in only 1 source: include only if the page image clearly confirms it.",
-  "- If all five sources are wrong on something, correct it using the image.",
+  "- If all four sources are wrong on something, correct it using the image.",
   "",
   "LANGUAGE:",
   "- Arabic text: preserve every Arabic word exactly. Maintain RTL character order within words.",
@@ -187,57 +163,7 @@ function stripThinking(raw: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Gemma4 direct vision extraction (pass 3)
-// ---------------------------------------------------------------------------
-
-async function extractWithGemma4(
-  client: OpenAI,
-  modelId: string,
-  pageImage: { base64: string; mimeType: string },
-  pageNum: number,
-  verbose: boolean,
-): Promise<string> {
-  if (verbose) {
-    console.log(
-      `[Word/Gemma4-Extract] Page ${pageNum}: sending ${Math.round((pageImage.base64.length * 0.75) / 1024)} KB...`,
-    );
-  }
-
-  const response = await client.chat.completions.create({
-    model: modelId,
-    messages: [
-      { role: "system", content: GEMMA_EXTRACT_SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: [
-          {
-            type: "image_url" as const,
-            image_url: { url: `data:${pageImage.mimeType};base64,${pageImage.base64}` },
-          },
-          {
-            type: "text" as const,
-            text: `Extract all text content from this document page (page ${pageNum}). Include Arabic and Latin text exactly as shown.`,
-          },
-        ] satisfies ChatCompletionContentPart[],
-      },
-    ],
-    max_tokens: 4096,
-    temperature: 0.1,
-  });
-
-  const text = stripThinking(response.choices[0]?.message.content ?? "");
-
-  if (verbose) {
-    console.log(
-      `[Word/Gemma4-Extract] Page ${pageNum}: extracted ${text.length} chars.`,
-    );
-  }
-
-  return text;
-}
-
-// ---------------------------------------------------------------------------
-// Gemma4 corroboration (pass 4)
+// Gemma4 corroboration
 // ---------------------------------------------------------------------------
 
 async function corroboratePage(
@@ -248,12 +174,11 @@ async function corroboratePage(
   ocrText: string,
   dotsOcrText: string,
   glmOcrText: string,
-  gemmaText: string,
   pageImage: { base64: string; mimeType: string },
   verbose: boolean,
 ): Promise<string> {
   if (verbose) {
-    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 5 sources...`);
+    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 4 sources...`);
   }
 
   const textBody = [
@@ -268,9 +193,6 @@ async function corroboratePage(
     ``,
     `=== SOURCE 4: GLM-OCR EXTRACTION (visual OCR) ===`,
     glmOcrText || "(no text extracted by GLM-OCR)",
-    ``,
-    `=== SOURCE 5: GEMMA4 VISION EXTRACTION (AI visual reading) ===`,
-    gemmaText || "(no text extracted by Gemma4)",
     ``,
     `Using the page image above as visual ground truth, produce the single most accurate version of this page's text.`,
   ].join("\n");
@@ -303,9 +225,9 @@ async function corroboratePage(
   }
 
   // If the model returned something meaningful, use it. Otherwise fall back
-  // to the best single source: prefer Gemma4 > OCR > pdfjs.
+  // to the best single OCR source: prefer GLM > dots > DeepSeek > pdfjs.
   if (result.length > 20) return result;
-  return gemmaText || ocrText || pdfjsText;
+  return glmOcrText || dotsOcrText || ocrText || pdfjsText;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,18 +338,17 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         }
       }
 
-      // ── Passes 2–5: All four model extractions run in parallel ────────────
-      // DeepSeek-OCR, dots.ocr, GLM-OCR, and Gemma4-direct are independent
-      // of each other, so we fire them all at once and wait for all results.
+      // ── Passes 2–4: Three OCR models run in parallel ─────────────────────
+      // DeepSeek-OCR, dots.ocr, and GLM-OCR are independent of each other,
+      // so we fire them all at once and wait for all results.
       let ocrText = "";
       let dotsOcrText = "";
       let glmOcrText = "";
-      let gemmaText = "";
 
       if (pageImage) {
         // Print a header line, then each model prints its own result line the
         // instant it finishes — output appears in completion order, not start order.
-        console.log(`       Extracting (4 models in parallel):`);
+        console.log(`       Extracting (3 OCR models in parallel):`);
         const t0 = Date.now();
 
         function liveModel(label: string, p: Promise<string>): Promise<string> {
@@ -447,11 +368,10 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           );
         }
 
-        [ocrText, dotsOcrText, glmOcrText, gemmaText] = await Promise.all([
+        [ocrText, dotsOcrText, glmOcrText] = await Promise.all([
           liveModel("DeepSeek-OCR", callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD)),
           liveModel("dots.ocr",     callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD)),
           liveModel("GLM-OCR",      callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,  verbose, OCR_SYSTEM_PROMPT_WORD)),
-          liveModel("Gemma4",       extractWithGemma4(client, structurerModelId, pageImage, pageNum, verbose)),
         ]);
       }
 
@@ -459,7 +379,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       let corroborated: string;
       if (pageImage) {
         try {
-          process.stdout.write(`       Corroborating (5 sources)...`);
+          process.stdout.write(`       Corroborating (4 sources)...`);
           const corrobStart = Date.now();
           corroborated = await corroboratePage(
             client,
@@ -469,7 +389,6 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
             ocrText,
             dotsOcrText,
             glmOcrText,
-            gemmaText,
             pageImage,
             verbose,
           );
@@ -480,7 +399,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           console.log(
             `       Corroboration error: ${corrobErr instanceof Error ? corrobErr.message : String(corrobErr)}`,
           );
-          corroborated = gemmaText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
+          corroborated = glmOcrText || dotsOcrText || ocrText || pdfjsText;
         }
       } else {
         // No image available — fall back to the pdfjs text layer only
@@ -494,7 +413,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         ocrText,
         dotsOcrText,
         glmOcrText,
-        gemmaText,
+        gemmaText: "",   // kept for progress-file backward compatibility
         corroborated,
       };
       progress.pages[pageKey] = extraction;
