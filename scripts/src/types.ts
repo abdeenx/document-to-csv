@@ -23,6 +23,7 @@ export const CliArgsSchema = z.object({
   ocrModel: z.string().default("mlx-community/DeepSeek-OCR-8bit"),
   dotsOcrModel: z.string().default("mlx-community/dots.ocr-bf16"),
   glmOcrModel: z.string().default("mlx-community/GLM-OCR-bf16"),
+  chandraOcrModel: z.string().default("jwindle47/chandra-ocr-2-8bit-mlx"),
   structurerModel: z
     .string()
     .default(
@@ -121,7 +122,9 @@ export interface PageExtraction {
   dotsOcrText: string;
   /** Text from the GLM-OCR visual pass. */
   glmOcrText: string;
-  /** Text from the Gemma4 direct vision extraction pass. */
+  /** Text from the Chandra-OCR visual pass. */
+  chandraOcrText: string;
+  /** Text from the Gemma4 direct vision extraction pass (legacy, kept for compat). */
   gemmaText: string;
   /** Final corroborated text (reconciled by Gemma4). */
   corroborated: string;
@@ -142,7 +145,8 @@ export const WordProgressSchema = z.object({
       ocrText: z.string(),
       dotsOcrText: z.string().default(""),
       glmOcrText: z.string().default(""),
-      gemmaText: z.string(),
+      chandraOcrText: z.string().default(""),
+      gemmaText: z.string().default(""),
       corroborated: z.string(),
     }),
   ),
