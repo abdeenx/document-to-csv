@@ -12,6 +12,26 @@ import { buildDataUrl } from "./lm-studio-client.js";
 const MAX_DIMENSION = 1600;
 
 // ---------------------------------------------------------------------------
+// Strip model thinking / reasoning traces
+//
+// Some models wrap their chain-of-thought in one of these patterns before the
+// actual answer. We strip every such block so callers never see reasoning
+// noise — only the final extracted text reaches the pipeline.
+//
+//   <|channel>thought  ...reasoning...  <channel|>   (Gemma4 / LM Studio)
+//   <thinking>         ...reasoning...  </thinking>
+//   <think>            ...reasoning...  </think>
+// ---------------------------------------------------------------------------
+
+export function stripThinking(raw: string): string {
+  let text = raw;
+  text = text.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, "");
+  text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  return text.trim();
+}
+
+// ---------------------------------------------------------------------------
 // Shared OCR system prompt — CSV / structured-data mode
 // ---------------------------------------------------------------------------
 
@@ -108,8 +128,13 @@ export async function callOcrModel(
     temperature: 0,
   });
 
-  const text = response.choices[0]?.message.content;
-  if (!text) throw new Error("[OCR] Model returned an empty response.");
+  const raw = response.choices[0]?.message.content;
+  if (!raw) throw new Error("[OCR] Model returned an empty response.");
+
+  // Strip thinking/reasoning blocks before returning — applies to every OCR
+  // model, not just Gemma4, since some OCR models also emit reasoning traces.
+  const text = stripThinking(raw);
+  if (!text) throw new Error("[OCR] Model returned only a thinking block with no extracted text.");
 
   if (verbose) {
     console.log(
