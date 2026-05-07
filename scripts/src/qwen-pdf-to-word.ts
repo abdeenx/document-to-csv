@@ -64,6 +64,42 @@ const QWEN_OCR_SYSTEM_PROMPT = [
 ].join("\n");
 
 // ---------------------------------------------------------------------------
+// Timing helpers
+// ---------------------------------------------------------------------------
+
+/** Format a duration in milliseconds as "X.Xs". */
+function fmtSec(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/**
+ * Format an ETA in milliseconds as a human-readable string.
+ * Examples: "~8s", "~1m 24s", "~12m 03s"
+ */
+function fmtEta(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `~${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `~${m}m ${rem < 10 ? "0" : ""}${rem}s`;
+}
+
+/**
+ * Format a wall-clock timestamp as "HH:MM:SS".
+ * Used to mark when each step started.
+ */
+function fmtClock(ts: number): string {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+/** Divider line used between page footer items. */
+const DIVIDER = "─".repeat(56);
+
+// ---------------------------------------------------------------------------
 // Progress file helpers
 // ---------------------------------------------------------------------------
 
@@ -157,7 +193,8 @@ async function extractPageWithQwen(
   const text = stripThinking(raw);
 
   if (verbose) {
-    console.log(`[Qwen] Page ${pageNum}: extracted ${text.length} chars.`);
+    const tokensUsed = response.usage?.total_tokens ?? "unknown";
+    console.log(`[Qwen] Page ${pageNum}: ${text.length} chars, ${tokensUsed} tokens`);
   }
 
   return text;
@@ -183,114 +220,177 @@ export interface QwenConvertArgs {
 export async function convertPdfToWordWithQwen(args: QwenConvertArgs): Promise<void> {
   const { pdfPath, outputPath, progressPath, client, qwenModelId, verbose } = args;
 
-  // ── Step 1: count pages ───────────────────────────────────────────────────
-  console.log("[Qwen] Step 1 — Counting pages...");
-  const { numPages } = await extractPdfjsPageTextsRaw(pdfPath, verbose);
-  console.log(`[Qwen]   ${numPages} page(s) found.`);
-  console.log("");
-
-  // ── Load progress ─────────────────────────────────────────────────────────
-  const progress = await loadQwenProgress(progressPath, pdfPath, numPages);
-
-  // ── Detect renderer ───────────────────────────────────────────────────────
-  const renderer: Renderer | null = await detectRenderer();
-  if (!renderer) {
-    console.log("[Qwen] Warning: No PDF renderer found (pdftoppm / mutool).");
-    console.log("         OCR pass will be skipped — pages will be blank.");
-    console.log("         Install via: brew install poppler  (provides pdftoppm)");
-    console.log("");
-  }
-
-  // ── Per-page extraction loop ──────────────────────────────────────────────
-  const tmpDir = join(tmpdir(), `qwen-word-${randomUUID()}`);
-  await mkdir(tmpDir, { recursive: true });
-
   const docStart = Date.now();
 
-  try {
-    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-      const pageKey = String(pageNum);
+  // ── Step 1: count pages ───────────────────────────────────────────────────
+  {
+    const t0 = Date.now();
+    process.stdout.write(`[Qwen] ${fmtClock(t0)}  Step 1 — Counting pages...`);
+    const { numPages } = await extractPdfjsPageTextsRaw(pdfPath, verbose);
+    const elapsed = fmtSec(Date.now() - t0);
+    process.stdout.write(` done  ${elapsed}  (${numPages} page(s))\n`);
+    console.log("");
 
-      if (progress.pages[pageKey]) {
-        if (verbose) {
-          console.log(`[Qwen] Page ${pageNum}/${numPages} — already done, skipping.`);
-        }
-        continue;
-      }
+    // ── Load progress ───────────────────────────────────────────────────────
+    const progress = await loadQwenProgress(progressPath, pdfPath, numPages);
 
-      const pageStart = Date.now();
-      console.log(`[Qwen] Page ${pageNum}/${numPages}:`);
-
-      // ── Render page ───────────────────────────────────────────────────────
-      let pageImage: { base64: string; mimeType: "image/jpeg" } | null = null;
+    // ── Detect renderer ─────────────────────────────────────────────────────
+    {
+      const tr = Date.now();
+      process.stdout.write(`[Qwen] ${fmtClock(tr)}  Detecting PDF renderer...`);
+      const renderer: Renderer | null = await detectRenderer();
+      const rendererElapsed = fmtSec(Date.now() - tr);
       if (renderer) {
-        try {
-          process.stdout.write(`       Rendering...`);
-          pageImage = await renderPageToJpeg(pdfPath, pageNum, renderer, tmpDir, verbose);
-          process.stdout.write(
-            ` done (${Math.round((pageImage.base64.length * 0.75) / 1024)} KB)\n`,
-          );
-        } catch (renderErr) {
-          process.stdout.write(` failed\n`);
-          console.log(
-            `       Render error: ${renderErr instanceof Error ? renderErr.message : String(renderErr)}`,
-          );
-        }
-      }
-
-      // ── Qwen extraction ───────────────────────────────────────────────────
-      let text = "";
-      if (pageImage) {
-        try {
-          const t0 = Date.now();
-          process.stdout.write(`       Extracting with Qwen2.5-VL...`);
-          text = await extractPageWithQwen(client, qwenModelId, pageNum, pageImage, verbose);
-          const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-          process.stdout.write(` done (${text.length} chars, ${elapsed}s)\n`);
-        } catch (extractErr) {
-          process.stdout.write(` failed\n`);
-          console.log(
-            `       Extraction error: ${extractErr instanceof Error ? extractErr.message : String(extractErr)}`,
-          );
-        }
+        process.stdout.write(` found  ${rendererElapsed}  (${renderer})\n`);
       } else {
-        console.log(`       No renderer — page will be blank.`);
+        process.stdout.write(` none found  ${rendererElapsed}\n`);
+        console.log("         Warning: No PDF renderer (pdftoppm / mutool).");
+        console.log("         OCR pass will be skipped — pages will be blank.");
+        console.log("         Install via: brew install poppler  (provides pdftoppm)");
+      }
+      console.log("");
+
+      // ── Per-page extraction loop ──────────────────────────────────────────
+      const tmpDir = join(tmpdir(), `qwen-word-${randomUUID()}`);
+      await mkdir(tmpDir, { recursive: true });
+
+      // Rolling page-time tracker for ETA estimation.
+      const pageTimes: number[] = [];
+
+      try {
+        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+          const pageKey = String(pageNum);
+          const pct = Math.round((pageNum / numPages) * 100);
+
+          if (progress.pages[pageKey]) {
+            if (verbose) {
+              console.log(
+                `[Qwen] Page ${pageNum}/${numPages} (${pct}%) — already done, skipping.`,
+              );
+            }
+            continue;
+          }
+
+          const pageStart = Date.now();
+          console.log(`[Qwen] ${fmtClock(pageStart)}  Page ${pageNum}/${numPages} (${pct}%):`);
+
+          // ── Render page ─────────────────────────────────────────────────────
+          let pageImage: { base64: string; mimeType: "image/jpeg" } | null = null;
+          let renderMs = 0;
+          if (renderer) {
+            const t = Date.now();
+            process.stdout.write(`         ${fmtClock(t)}  Rendering to JPEG...`);
+            try {
+              pageImage = await renderPageToJpeg(pdfPath, pageNum, renderer, tmpDir, verbose);
+              renderMs = Date.now() - t;
+              const kb = Math.round((pageImage.base64.length * 0.75) / 1024);
+              process.stdout.write(` done  ${fmtSec(renderMs)}  (${kb} KB)\n`);
+            } catch (renderErr) {
+              renderMs = Date.now() - t;
+              process.stdout.write(` failed  ${fmtSec(renderMs)}\n`);
+              console.log(
+                `         Error: ${renderErr instanceof Error ? renderErr.message : String(renderErr)}`,
+              );
+            }
+          }
+
+          // ── Qwen inference ──────────────────────────────────────────────────
+          let text = "";
+          let inferMs = 0;
+          if (pageImage) {
+            const t = Date.now();
+            process.stdout.write(`         ${fmtClock(t)}  Qwen2.5-VL inference...`);
+            try {
+              text = await extractPageWithQwen(client, qwenModelId, pageNum, pageImage, verbose);
+              inferMs = Date.now() - t;
+              process.stdout.write(` done  ${fmtSec(inferMs)}  (${text.length} chars)\n`);
+            } catch (extractErr) {
+              inferMs = Date.now() - t;
+              process.stdout.write(` failed  ${fmtSec(inferMs)}\n`);
+              console.log(
+                `         Error: ${extractErr instanceof Error ? extractErr.message : String(extractErr)}`,
+              );
+            }
+          } else {
+            console.log(`         No renderer — page will be blank.`);
+          }
+
+          // ── Strip thinking + save progress ──────────────────────────────────
+          {
+            const t = Date.now();
+            process.stdout.write(`         ${fmtClock(t)}  Saving progress...`);
+            progress.pages[pageKey] = { text };
+            await saveQwenProgress(progressPath, progress);
+            const saveMs = Date.now() - t;
+            process.stdout.write(` done  ${fmtSec(saveMs)}\n`);
+          }
+
+          // ── Page summary + ETA ──────────────────────────────────────────────
+          const pageMs = Date.now() - pageStart;
+          pageTimes.push(pageMs);
+
+          const avgMs = pageTimes.reduce((a, b) => a + b, 0) / pageTimes.length;
+          const remaining = numPages - pageNum;
+
+          console.log(`         ${DIVIDER}`);
+
+          const parts = [
+            `render ${fmtSec(renderMs)}`,
+            `inference ${fmtSec(inferMs)}`,
+          ];
+
+          if (remaining > 0) {
+            const etaStr = fmtEta(avgMs * remaining);
+            console.log(
+              `         Page ${pageNum} done in ${fmtSec(pageMs)}  [${parts.join("  ·  ")}]`,
+            );
+            console.log(
+              `         avg ${fmtSec(avgMs)}/page  ·  ${remaining} page(s) remaining  ·  ETA ${etaStr}`,
+            );
+          } else {
+            console.log(
+              `         Page ${pageNum} done in ${fmtSec(pageMs)}  [${parts.join("  ·  ")}]`,
+            );
+          }
+
+          console.log("");
+        }
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true });
       }
 
-      // ── Save progress ─────────────────────────────────────────────────────
-      progress.pages[pageKey] = { text };
-      await saveQwenProgress(progressPath, progress);
+      // ── Generate Word document ────────────────────────────────────────────
+      {
+        const t = Date.now();
+        process.stdout.write(`[Qwen] ${fmtClock(t)}  Building Word document...`);
+        const orderedPages = Array.from({ length: numPages }, (_, i) => ({
+          pageNum: i + 1,
+          text: progress.pages[String(i + 1)]?.text ?? "",
+        }));
+        await generateWordDoc(orderedPages, outputPath, verbose);
+        const buildMs = Date.now() - t;
+        process.stdout.write(` done  ${fmtSec(buildMs)}\n`);
+      }
 
-      const pageSec = ((Date.now() - pageStart) / 1000).toFixed(1);
-      console.log(`       Page ${pageNum} done in ${pageSec}s`);
+      // ── Final summary ─────────────────────────────────────────────────────
+      const totalMs = Date.now() - docStart;
+      const processedPages = pageTimes.length;
+      const avgPerPage =
+        processedPages > 0
+          ? fmtSec(pageTimes.reduce((a, b) => a + b, 0) / processedPages)
+          : "n/a";
+
+      console.log("");
+      console.log(`${"═".repeat(56)}`);
+      console.log(`  Done!`);
+      console.log(`  Output:          ${outputPath}`);
+      console.log(`  Progress file:   ${progressPath}`);
+      console.log(`  (Delete the progress file to re-process from scratch.)`);
+      console.log("");
+      console.log(`  Pages processed: ${processedPages} of ${numPages}`);
+      console.log(`  Avg per page:    ${avgPerPage}`);
+      console.log(`  Total elapsed:   ${fmtSec(totalMs)}`);
+      console.log(`${"═".repeat(56)}`);
     }
-  } finally {
-    await rm(tmpDir, { recursive: true, force: true });
   }
-
-  console.log("");
-
-  // ── Generate Word document ────────────────────────────────────────────────
-  console.log("[Qwen] Generating Word document...");
-  const docGenStart = Date.now();
-
-  const orderedPages = Array.from({ length: numPages }, (_, i) => ({
-    pageNum: i + 1,
-    text: progress.pages[String(i + 1)]?.text ?? "",
-  }));
-
-  await generateWordDoc(orderedPages, outputPath, verbose);
-
-  const totalSec = ((Date.now() - docStart) / 1000).toFixed(1);
-  const docGenSec = ((Date.now() - docGenStart) / 1000).toFixed(1);
-
-  console.log("");
-  console.log("Done!");
-  console.log(`  Word document:  ${outputPath}`);
-  console.log(`  Progress file:  ${progressPath}`);
-  console.log(`  (Delete the progress file to re-process from scratch next time.)`);
-  console.log("");
-  console.log(`  Timing:`);
-  console.log(`    Document build:  ${docGenSec}s`);
-  console.log(`    Total elapsed:   ${totalSec}s`);
 }
