@@ -59,11 +59,12 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       output:             { type: "string",  short: "o" },
       excel:              { type: "boolean", default: false },
       word:               { type: "boolean", default: false },
-      "lm-studio-url":    { type: "string" },
-      "ocr-model":        { type: "string" },
-      "dots-ocr-model":   { type: "string" },
-      "glm-ocr-model":    { type: "string" },
-      "structurer-model": { type: "string" },
+      "lm-studio-url":      { type: "string" },
+      "ocr-model":          { type: "string" },
+      "dots-ocr-model":     { type: "string" },
+      "glm-ocr-model":      { type: "string" },
+      "chandra-ocr-model":  { type: "string" },
+      "structurer-model":   { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
     },
@@ -107,9 +108,10 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     imagePath:       resolve(callerCwd, inputPath),
     outputPath:      values.output ? resolve(callerCwd, values.output) : defaultOutput,
     lmStudioUrl:     values["lm-studio-url"]    ?? "http://localhost:1234/v1",
-    ocrModel:        values["ocr-model"]         ?? "mlx-community/DeepSeek-OCR-8bit",
-    dotsOcrModel:    values["dots-ocr-model"]    ?? "mlx-community/dots.ocr-bf16",
-    glmOcrModel:     values["glm-ocr-model"]     ?? "mlx-community/GLM-OCR-bf16",
+    ocrModel:        values["ocr-model"]          ?? "mlx-community/DeepSeek-OCR-8bit",
+    dotsOcrModel:    values["dots-ocr-model"]     ?? "mlx-community/dots.ocr-bf16",
+    glmOcrModel:     values["glm-ocr-model"]      ?? "mlx-community/GLM-OCR-bf16",
+    chandraOcrModel: values["chandra-ocr-model"]  ?? "jwindle47/chandra-ocr-2-8bit-mlx",
     structurerModel: values["structurer-model"]  ??
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     verbose: values.verbose ?? false,
@@ -195,6 +197,7 @@ async function main(): Promise<void> {
     console.log(`  DeepSeek-OCR:   ${args.ocrModel}`);
     console.log(`  dots.ocr:       ${args.dotsOcrModel}`);
     console.log(`  GLM-OCR:        ${args.glmOcrModel}`);
+    console.log(`  Chandra-OCR:    ${args.chandraOcrModel}`);
     console.log(`  Struct model:   ${args.structurerModel}`);
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
@@ -202,15 +205,16 @@ async function main(): Promise<void> {
     const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
 
     await convertPdfToWord({
-      pdfPath:           args.imagePath,
-      outputPath:        args.outputPath!,
+      pdfPath:            args.imagePath,
+      outputPath:         args.outputPath!,
       progressPath,
       client,
-      ocrModelId:        args.ocrModel,
-      dotsOcrModelId:    args.dotsOcrModel,
-      glmOcrModelId:     args.glmOcrModel,
-      structurerModelId: args.structurerModel,
-      verbose:           args.verbose,
+      ocrModelId:         args.ocrModel,
+      dotsOcrModelId:     args.dotsOcrModel,
+      glmOcrModelId:      args.glmOcrModel,
+      chandraOcrModelId:  args.chandraOcrModel,
+      structurerModelId:  args.structurerModel,
+      verbose:            args.verbose,
     });
 
     return;
