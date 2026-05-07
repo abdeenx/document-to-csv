@@ -25,13 +25,16 @@
  *     the matching cell anchor.
  *
  * ── Mode 3: PDF → Word (.docx) ──────────────────────────────────────────────
- *   Per page, four passes run:
- *     1. pdfjs text layer   — structural text
- *     2. DeepSeek-OCR       — visual extraction from a rendered page image
- *     3. Gemma4 direct      — Gemma4's own vision extraction pass
- *     4. Gemma4 corroborate — reconciles all 3 sources into the most accurate text
+ *   Per page, four OCR models run in parallel then Gemma4 corroborates:
+ *     1. DeepSeek-OCR, dots.ocr, GLM-OCR, Chandra-OCR (parallel)
+ *     2. Gemma4 corroborate — reconciles 4 sources into the most accurate text
  *
  *   Arabic (RTL) and Latin text are both preserved.
+ *   Progress is saved after every page — resume safely if interrupted.
+ *
+ * ── Mode 4: PDF → Word via Qwen2.5-VL (`--qwen-word`) ───────────────────────
+ *   Single-model pipeline — one Qwen2.5-VL call per page, no corroboration.
+ *   Faster and simpler than Mode 3; strong Arabic + Latin accuracy.
  *   Progress is saved after every page — resume safely if interrupted.
  *
  * Usage:
@@ -48,6 +51,7 @@ import { extractTextFromPdf, extractPdfPageLayouts } from "./pdf.js";
 import { verifyDocumentWithGemma, generateCsvWithGemma } from "./csv-generator.js";
 import { generateExcel } from "./excel-generator.js";
 import { convertPdfToWord, enhanceProgressFile } from "./pdf-to-word.js";
+import { convertPdfToWordWithQwen } from "./qwen-pdf-to-word.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -60,12 +64,14 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       excel:              { type: "boolean", default: false },
       word:               { type: "boolean", default: false },
       enhance:            { type: "boolean", default: false },
+      "qwen-word":          { type: "boolean", default: false },
       "lm-studio-url":      { type: "string" },
       "ocr-model":          { type: "string" },
       "dots-ocr-model":     { type: "string" },
       "glm-ocr-model":      { type: "string" },
       "chandra-ocr-model":  { type: "string" },
       "structurer-model":   { type: "string" },
+      "qwen-model":         { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
     },
@@ -77,8 +83,9 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(values.help ? 0 : 1);
   }
 
-  if (values.excel && values.word) {
-    console.error("Error: --excel and --word are mutually exclusive. Choose one.");
+  const modeCount = [values.excel, values.word, values["qwen-word"]].filter(Boolean).length;
+  if (modeCount > 1) {
+    console.error("Error: --excel, --word, and --qwen-word are mutually exclusive. Choose one.");
     process.exit(1);
   }
 
@@ -100,12 +107,17 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(1);
   }
 
+  if (values["qwen-word"] && ext !== PDF_EXTENSION) {
+    console.error("Error: --qwen-word mode requires a PDF input file.");
+    process.exit(1);
+  }
+
   const inputBase = basename(inputPath, extname(inputPath));
   const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
 
   let outputExt: string;
   if (values.excel) outputExt = ".xlsx";
-  else if (values.word) outputExt = ".docx";
+  else if (values.word || values["qwen-word"]) outputExt = ".docx";
   else outputExt = ".csv";
 
   const defaultOutput = resolve(callerCwd, `${inputBase}${outputExt}`);
@@ -120,10 +132,12 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     chandraOcrModel: values["chandra-ocr-model"]  ?? "jwindle47/chandra-ocr-2-8bit-mlx",
     structurerModel: values["structurer-model"]  ??
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
-    verbose: values.verbose  ?? false,
-    excel:   values.excel    ?? false,
-    word:    values.word     ?? false,
-    enhance: values.enhance  ?? false,
+    qwenModel: values["qwen-model"] ?? "mlx-community/Qwen2.5-VL-7B-Instruct-8bit",
+    verbose:  values.verbose        ?? false,
+    excel:    values.excel          ?? false,
+    word:     values.word           ?? false,
+    enhance:  values.enhance        ?? false,
+    qwenWord: values["qwen-word"]   ?? false,
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -160,18 +174,24 @@ Options:
                                  "Document"  — layout-faithful sheet (text at PDF
                                                positions, embedded images)
   --word                       Write a Word (.docx) file (PDF input only).
-                               Runs four passes per page:
-                                 1. pdfjs text layer
-                                 2. DeepSeek-OCR visual extraction
-                                 3. Gemma4 direct vision extraction
-                                 4. Gemma4 corroboration of all 3 sources
+                               Runs 4 OCR models in parallel then Gemma4
+                               corroborates to produce the most accurate text.
                                Arabic (RTL) and Latin text are both preserved.
                                Progress is saved after every page — re-run the
                                same command to resume if interrupted.
+  --enhance                    Re-run OCR on weak pages in an existing --word
+                               progress file, then regenerate the docx.
+  --qwen-word                  Write a Word (.docx) file (PDF input only) using
+                               a single Qwen2.5-VL pass per page — no multi-
+                               model corroboration required. Faster and lighter
+                               than --word while retaining strong Arabic accuracy.
+                               Progress is saved after every page — resumable.
   --lm-studio-url <url>        LM Studio base URL (default: http://localhost:1234/v1)
   --ocr-model <id>             OCR model (default: mlx-community/DeepSeek-OCR-8bit)
-  --structurer-model <id>      Structuring model
+  --structurer-model <id>      Structuring / corroboration model
                                (default: zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine)
+  --qwen-model <id>            Qwen vision model used by --qwen-word
+                               (default: mlx-community/Qwen2.5-VL-7B-Instruct-8bit)
   -v, --verbose                Enable step-by-step logging
   -h, --help                   Show this help message
 
@@ -186,12 +206,41 @@ Examples:
   pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word --verbose
   pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word --enhance
   pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --output ./data/report.xlsx --excel
+  pnpm --filter @workspace/scripts run document-to-csv ./arabic.pdf --qwen-word
+  pnpm --filter @workspace/scripts run document-to-csv ./arabic.pdf --qwen-word --output ./out/arabic.docx
 `);
 }
 
 async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
+
+  // ── Mode 4: PDF → Word via Qwen2.5-VL (single-model) ────────────────────
+  if (args.qwenWord) {
+    const progressPath = args.outputPath!.replace(/\.docx$/i, ".qwen-progress.json");
+
+    console.log("document-to-csv (PDF → Word / Qwen2.5-VL mode)");
+    console.log("=================================================");
+    console.log(`  Input:          ${args.imagePath}`);
+    console.log(`  Output:         ${args.outputPath}`);
+    console.log(`  Progress file:  ${progressPath}`);
+    console.log(`  Qwen model:     ${args.qwenModel}`);
+    console.log(`  LM Studio:      ${args.lmStudioUrl}`);
+    console.log("");
+
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+
+    await convertPdfToWordWithQwen({
+      pdfPath:      args.imagePath,
+      outputPath:   args.outputPath!,
+      progressPath,
+      client,
+      qwenModelId:  args.qwenModel,
+      verbose:      args.verbose,
+    });
+
+    return;
+  }
 
   // ── Mode 3: PDF → Word (normal or enhance) ───────────────────────────────
   if (args.word) {
