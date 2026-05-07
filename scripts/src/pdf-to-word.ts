@@ -38,7 +38,7 @@ import {
   extractPdfjsPageTextsRaw,
   type Renderer,
 } from "./pdf.js";
-import { callOcrModel, OCR_SYSTEM_PROMPT_WORD } from "./ocr.js";
+import { callOcrModel, OCR_SYSTEM_PROMPT_WORD, stripThinking } from "./ocr.js";
 import { WordProgressSchema, type WordProgress, type PageExtraction } from "./types.js";
 import { generateWordDoc } from "./word-generator.js";
 
@@ -50,12 +50,11 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "You are a document accuracy expert specializing in Arabic and Latin text.",
   "You will receive:",
   "  1. A rendered image of a PDF page (use this as the visual ground truth).",
-  "  2. Five independently extracted text versions of that page:",
-  "       Source 1 — PDF text layer (pdfjs, structural/positional)",
-  "       Source 2 — DeepSeek-OCR (visual OCR model)",
-  "       Source 3 — dots.ocr (visual OCR model)",
-  "       Source 4 — GLM-OCR (visual OCR model)",
-  "       Source 5 — Chandra-OCR (visual OCR model)",
+  "  2. Four independently extracted text versions of that page:",
+  "       Source 1 — DeepSeek-OCR (visual OCR model)",
+  "       Source 2 — dots.ocr (visual OCR model)",
+  "       Source 3 — GLM-OCR (visual OCR model)",
+  "       Source 4 — Chandra-OCR (visual OCR model)",
   "",
   "Your task: produce a single, maximally accurate version of the page's text content.",
   "",
@@ -64,7 +63,7 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "- Content appearing in 3 or more sources is almost certainly correct — include it.",
   "- Content in 2 sources: include if the page image does not contradict it.",
   "- Content in only 1 source: include only if the page image clearly confirms it.",
-  "- If all five sources are wrong on something, correct it using the image.",
+  "- If all four sources are wrong on something, correct it using the image.",
   "",
   "LANGUAGE:",
   "- Arabic text: preserve every Arabic word exactly. Maintain RTL character order within words.",
@@ -78,7 +77,7 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "- Lists: preserve numbering and bullet markers.",
   "",
   "OUTPUT:",
-  "- Only the final corroborated text. No commentary, no markdown fences.",
+  "- Only the final corroborated text. No commentary, no markdown fences, no reasoning traces.",
 ].join("\n");
 
 // ---------------------------------------------------------------------------
@@ -135,35 +134,6 @@ async function saveProgress(
 }
 
 // ---------------------------------------------------------------------------
-// Strip model thinking / reasoning traces
-//
-// Some models (e.g. Gemma4 with reasoning enabled) wrap their chain-of-thought
-// in one of these patterns before the actual answer:
-//
-//   <|channel>thought  ...reasoning...  <channel|>
-//   <thinking>         ...reasoning...  </thinking>
-//   <think>            ...reasoning...  </think>
-//
-// We strip all such blocks and then trim, so only the final answer text
-// reaches the Word document.
-// ---------------------------------------------------------------------------
-
-function stripThinking(raw: string): string {
-  let text = raw;
-
-  // <|channel>thought ... <channel|>  (Gemma4 / LM Studio reasoning format)
-  text = text.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, "");
-
-  // <thinking> ... </thinking>
-  text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
-
-  // <think> ... </think>
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
-
-  return text.trim();
-}
-
-// ---------------------------------------------------------------------------
 // Gemma4 corroboration
 // ---------------------------------------------------------------------------
 
@@ -171,7 +141,6 @@ async function corroboratePage(
   client: OpenAI,
   modelId: string,
   pageNum: number,
-  pdfjsText: string,
   ocrText: string,
   dotsOcrText: string,
   glmOcrText: string,
@@ -180,23 +149,20 @@ async function corroboratePage(
   verbose: boolean,
 ): Promise<string> {
   if (verbose) {
-    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 5 sources...`);
+    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 4 OCR sources...`);
   }
 
   const textBody = [
-    `=== SOURCE 1: PDF TEXT LAYER (structural embedding) ===`,
-    pdfjsText || "(no text extracted from text layer)",
-    ``,
-    `=== SOURCE 2: DEEPSEEK-OCR EXTRACTION (visual OCR) ===`,
+    `=== SOURCE 1: DEEPSEEK-OCR EXTRACTION (visual OCR) ===`,
     ocrText || "(no text extracted by DeepSeek-OCR)",
     ``,
-    `=== SOURCE 3: DOTS.OCR EXTRACTION (visual OCR) ===`,
+    `=== SOURCE 2: DOTS.OCR EXTRACTION (visual OCR) ===`,
     dotsOcrText || "(no text extracted by dots.ocr)",
     ``,
-    `=== SOURCE 4: GLM-OCR EXTRACTION (visual OCR) ===`,
+    `=== SOURCE 3: GLM-OCR EXTRACTION (visual OCR) ===`,
     glmOcrText || "(no text extracted by GLM-OCR)",
     ``,
-    `=== SOURCE 5: CHANDRA-OCR EXTRACTION (visual OCR) ===`,
+    `=== SOURCE 4: CHANDRA-OCR EXTRACTION (visual OCR) ===`,
     chandraOcrText || "(no text extracted by Chandra-OCR)",
     ``,
     `Using the page image above as visual ground truth, produce the single most accurate version of this page's text.`,
@@ -230,9 +196,9 @@ async function corroboratePage(
   }
 
   // If the model returned something meaningful, use it. Otherwise fall back
-  // to the best single OCR source: prefer Chandra > GLM > dots > DeepSeek > pdfjs.
+  // to the best single OCR source: prefer Chandra > GLM > dots > DeepSeek.
   if (result.length > 20) return result;
-  return chandraOcrText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
+  return chandraOcrText || glmOcrText || dotsOcrText || ocrText;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,20 +239,9 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
     verbose,
   } = args;
 
-  // ── Step 1: pdfjs text layer (all pages at once) ──────────────────────────
-  console.log("[Word] Step 1 — Extracting PDF text layer (pdfjs)...");
-  const { pageTexts: pdfjsPageTexts, numPages, hasAnyText } =
-    await extractPdfjsPageTextsRaw(pdfPath, verbose);
-
-  if (!hasAnyText) {
-    console.log(
-      "[Word] Warning: No embedded text layer found in this PDF (possibly scanned).",
-    );
-    console.log(
-      "         OCR and Gemma4 vision passes will still run on each rendered page.",
-    );
-  }
-
+  // ── Step 1: count pages via pdfjs (text layer discarded) ─────────────────
+  console.log("[Word] Step 1 — Counting pages...");
+  const { numPages } = await extractPdfjsPageTextsRaw(pdfPath, verbose);
   console.log(`[Word]   ${numPages} page(s) found.`);
   console.log("");
 
@@ -327,8 +282,6 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
 
       const pageStart = Date.now();
       console.log(`[Word] Page ${pageNum}/${numPages}:`);
-
-      const pdfjsText = pdfjsPageTexts[pageNum - 1] ?? "";
 
       // ── Render page ───────────────────────────────────────────────────────
       let pageImage: { base64: string; mimeType: "image/jpeg" } | null = null;
@@ -381,17 +334,16 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         ]);
       }
 
-      // ── Pass 6: Corroboration ─────────────────────────────────────────────
+      // ── Pass 5: Corroboration ─────────────────────────────────────────────
       let corroborated: string;
       if (pageImage) {
         try {
-          process.stdout.write(`       Corroborating (5 sources)...`);
+          process.stdout.write(`       Corroborating (4 OCR sources)...`);
           const corrobStart = Date.now();
           corroborated = await corroboratePage(
             client,
             structurerModelId,
             pageNum,
-            pdfjsText,
             ocrText,
             dotsOcrText,
             glmOcrText,
@@ -406,17 +358,17 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           console.log(
             `       Corroboration error: ${corrobErr instanceof Error ? corrobErr.message : String(corrobErr)}`,
           );
-          corroborated = chandraOcrText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
+          corroborated = chandraOcrText || glmOcrText || dotsOcrText || ocrText;
         }
       } else {
-        // No image available — fall back to the pdfjs text layer only
-        corroborated = pdfjsText;
-        console.log(`       No renderer — using pdfjs text layer only.`);
+        // No renderer — nothing can be extracted
+        corroborated = "";
+        console.log(`       No renderer — page will be blank.`);
       }
 
       // ── Save progress ─────────────────────────────────────────────────────
       const extraction: PageExtraction = {
-        pdfjsText,
+        pdfjsText: "",   // pdfjs text no longer used as LLM source; kept for schema compat
         ocrText,
         dotsOcrText,
         glmOcrText,
@@ -677,7 +629,7 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
         (m) => isSubstantial(updatedData[m.key] as string),
       ).length;
       process.stdout.write(
-        `         → ${newSubstantialCount}/4 sources populated. Re-corroborating (5 sources)...`,
+        `         → ${newSubstantialCount}/4 sources populated. Re-corroborating...`,
       );
 
       let anyImproved = false;
@@ -687,7 +639,6 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
           client,
           structurerModelId,
           pageNum,
-          updatedData.pdfjsText,
           updatedData.ocrText,
           updatedData.dotsOcrText,
           updatedData.glmOcrText,
@@ -709,6 +660,7 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
 
       // ── Persist (resumable) ───────────────────────────────────────────────
       if (anyImproved) {
+        updatedData.pdfjsText = "";  // ensure pdfjs text is never re-introduced
         progress.pages[pageKey] = updatedData;
         await saveProgress(progressPath, progress);
         pagesImproved++;
