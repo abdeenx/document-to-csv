@@ -32,6 +32,7 @@ export const CliArgsSchema = z.object({
   verbose: z.boolean().default(false),
   excel: z.boolean().default(false),
   word: z.boolean().default(false),
+  enhance: z.boolean().default(false),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
