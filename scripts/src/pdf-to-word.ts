@@ -475,13 +475,9 @@ function isSubstantial(text: string): boolean {
  * Enhance an existing conversion by re-running OCR on pages where fewer than
  * 3 of the 4 OCR models produced substantial text.
  *
- * For each such page:
- *   - Each weak model is retried up to MAX_RETRY_ATTEMPTS times.
- *   - After retries the page is re-corroborated with whatever sources are
- *     available (best-case scenario).
- *   - Progress is saved after each improved page so the run is resumable.
- *
- * The Word document is regenerated from the updated progress file at the end.
+ * For each such page all weak models are retried in parallel (up to
+ * MAX_RETRY_ATTEMPTS sequential attempts per model). Results print to the
+ * terminal in real time as each attempt finishes, regardless of order.
  *
  * Backward compatible: existing progress files without `chandraOcrText` parse
  * fine because the field defaults to "".
@@ -534,7 +530,7 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
     return;
   }
 
-  console.log(`[Enhance] ${completedCount}/${totalPages} pages completed.`);
+  console.log(`[Enhance] ${completedCount}/${totalPages} pages completed in progress file.`);
   console.log("[Enhance] Scanning OCR coverage...");
   console.log("");
 
@@ -561,19 +557,65 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
   let pagesImproved = 0;
   let pagesAlreadyOk = 0;
 
+  // ── Helper: retry one OCR model up to maxAttempts times, printing live ────
+  // Sequential attempts per model, but models run concurrently with each other
+  // via Promise.all below. Each attempt prints immediately on completion.
+  function retryModel(
+    label: string,
+    modelId: string,
+    image: { base64: string; mimeType: string },
+    t0: number,
+  ): Promise<string> {
+    const pad = label.padEnd(14);
+    async function attempt(n: number): Promise<string> {
+      try {
+        const text = await callOcrModel(
+          client,
+          image.base64,
+          image.mimeType,
+          modelId,
+          verbose,
+          OCR_SYSTEM_PROMPT_WORD,
+        );
+        const s = ((Date.now() - t0) / 1000).toFixed(1);
+        if (isSubstantial(text)) {
+          process.stdout.write(
+            `           ✓ ${pad} attempt ${n}/${MAX_RETRY_ATTEMPTS}  ${text.length} chars  (${s}s)\n`,
+          );
+          return text;
+        }
+        process.stdout.write(
+          `           ✗ ${pad} attempt ${n}/${MAX_RETRY_ATTEMPTS}  ${text.length} chars (too short)  (${s}s)\n`,
+        );
+      } catch (err) {
+        const s = ((Date.now() - t0) / 1000).toFixed(1);
+        const msg = err instanceof Error ? err.message.slice(0, 60) : String(err);
+        process.stdout.write(
+          `           ✗ ${pad} attempt ${n}/${MAX_RETRY_ATTEMPTS}  error: ${msg}  (${s}s)\n`,
+        );
+      }
+      if (n < MAX_RETRY_ATTEMPTS) return attempt(n + 1);
+      return "";
+    }
+    return attempt(1);
+  }
+
   try {
     for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+      const pct = Math.round((pageNum / totalPages) * 100);
       const pageKey = String(pageNum);
       const pageData = progress.pages[pageKey];
 
       if (!pageData) {
         if (verbose) {
-          console.log(`[Enhance] Page ${pageNum}/${totalPages}: not yet extracted — skipping.`);
+          console.log(
+            `[Enhance] Page ${pageNum}/${totalPages} (${pct}%): not yet extracted — skipping.`,
+          );
         }
         continue;
       }
 
-      // ── Check how many OCR sources already have substantial text ──────────
+      // ── Count how many OCR sources have substantial text ──────────────────
       const weakModels = ocrModels.filter(
         (m) => !isSubstantial(pageData[m.key] as string),
       );
@@ -583,17 +625,17 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
         pagesAlreadyOk++;
         if (verbose) {
           console.log(
-            `[Enhance] Page ${pageNum}/${totalPages}: ${substantialCount}/4 sources OK — skipping.`,
+            `[Enhance] Page ${pageNum}/${totalPages} (${pct}%): ${substantialCount}/4 sources OK — skipping.`,
           );
         }
         continue;
       }
 
       console.log(
-        `[Enhance] Page ${pageNum}/${totalPages}: ${substantialCount}/4 OCR sources populated — enhancing...`,
+        `[Enhance] Page ${pageNum}/${totalPages} (${pct}%): ${substantialCount}/4 OCR sources — enhancing...`,
       );
 
-      // ── Render the page ───────────────────────────────────────────────────
+      // ── Render ────────────────────────────────────────────────────────────
       let pageImage: { base64: string; mimeType: "image/jpeg" } | null = null;
       try {
         process.stdout.write(`         Rendering...`);
@@ -609,55 +651,36 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
         continue;
       }
 
-      // ── Retry each weak model up to MAX_RETRY_ATTEMPTS times ─────────────
+      // ── All weak models retry in parallel, printing results as they arrive ─
       const updatedData: PageExtraction = { ...pageData };
-      let anyImproved = false;
 
-      for (const model of weakModels) {
-        let gotSubstantial = false;
-        for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
-          process.stdout.write(
-            `         Retrying ${model.label} (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})... `,
-          );
-          try {
-            const text = await callOcrModel(
-              client,
-              pageImage.base64,
-              pageImage.mimeType,
-              model.modelId,
-              verbose,
-              OCR_SYSTEM_PROMPT_WORD,
-            );
-            if (isSubstantial(text)) {
-              process.stdout.write(`✓  ${text.length} chars\n`);
-              updatedData[model.key] = text;
-              gotSubstantial = true;
-              anyImproved = true;
-              break;
-            } else {
-              process.stdout.write(`✗  ${text.length} chars (too short)\n`);
-            }
-          } catch (ocrErr) {
-            const msg =
-              ocrErr instanceof Error ? ocrErr.message.slice(0, 80) : String(ocrErr);
-            process.stdout.write(`✗  error: ${msg}\n`);
+      if (weakModels.length > 0) {
+        console.log(
+          `         Retrying ${weakModels.length} weak model(s) in parallel:`,
+        );
+        const t0 = Date.now();
+
+        const retryResults = await Promise.all(
+          weakModels.map((m) => retryModel(m.label, m.modelId, pageImage!, t0)),
+        );
+
+        for (let i = 0; i < weakModels.length; i++) {
+          const text = retryResults[i]!;
+          if (isSubstantial(text)) {
+            updatedData[weakModels[i]!.key] = text;
           }
-        }
-        if (!gotSubstantial && verbose) {
-          console.log(
-            `         ${model.label}: could not get substantial text after ${MAX_RETRY_ATTEMPTS} attempts.`,
-          );
         }
       }
 
-      // ── Re-corroborate with whatever we now have ──────────────────────────
+      // ── Re-corroborate with all available sources ─────────────────────────
       const newSubstantialCount = ocrModels.filter(
         (m) => isSubstantial(updatedData[m.key] as string),
       ).length;
-      console.log(
-        `         → ${newSubstantialCount}/4 sources populated. Re-corroborating...`,
+      process.stdout.write(
+        `         → ${newSubstantialCount}/4 sources populated. Re-corroborating (5 sources)...`,
       );
 
+      let anyImproved = false;
       try {
         const corrStart = Date.now();
         const corroborated = await corroboratePage(
@@ -674,17 +697,17 @@ export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<v
         );
         const corrSec = ((Date.now() - corrStart) / 1000).toFixed(1);
         process.stdout.write(
-          `         ✓ Corroborated (${corroborated.length} chars, ${corrSec}s)\n`,
+          ` done (${corroborated.length} chars, ${corrSec}s)\n`,
         );
         updatedData.corroborated = corroborated;
         anyImproved = true;
       } catch (corrobErr) {
         const msg =
           corrobErr instanceof Error ? corrobErr.message.slice(0, 80) : String(corrobErr);
-        console.log(`         Corroboration failed: ${msg} — keeping existing text.`);
+        process.stdout.write(` failed: ${msg} — keeping existing text.\n`);
       }
 
-      // ── Persist after each improved page (resumable) ─────────────────────
+      // ── Persist (resumable) ───────────────────────────────────────────────
       if (anyImproved) {
         progress.pages[pageKey] = updatedData;
         await saveProgress(progressPath, progress);
