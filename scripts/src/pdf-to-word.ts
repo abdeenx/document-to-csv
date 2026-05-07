@@ -50,11 +50,12 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "You are a document accuracy expert specializing in Arabic and Latin text.",
   "You will receive:",
   "  1. A rendered image of a PDF page (use this as the visual ground truth).",
-  "  2. Four independently extracted text versions of that page:",
+  "  2. Five independently extracted text versions of that page:",
   "       Source 1 — PDF text layer (pdfjs, structural/positional)",
   "       Source 2 — DeepSeek-OCR (visual OCR model)",
   "       Source 3 — dots.ocr (visual OCR model)",
   "       Source 4 — GLM-OCR (visual OCR model)",
+  "       Source 5 — Chandra-OCR (visual OCR model)",
   "",
   "Your task: produce a single, maximally accurate version of the page's text content.",
   "",
@@ -63,7 +64,7 @@ const CORROBORATE_SYSTEM_PROMPT = [
   "- Content appearing in 3 or more sources is almost certainly correct — include it.",
   "- Content in 2 sources: include if the page image does not contradict it.",
   "- Content in only 1 source: include only if the page image clearly confirms it.",
-  "- If all four sources are wrong on something, correct it using the image.",
+  "- If all five sources are wrong on something, correct it using the image.",
   "",
   "LANGUAGE:",
   "- Arabic text: preserve every Arabic word exactly. Maintain RTL character order within words.",
@@ -174,11 +175,12 @@ async function corroboratePage(
   ocrText: string,
   dotsOcrText: string,
   glmOcrText: string,
+  chandraOcrText: string,
   pageImage: { base64: string; mimeType: string },
   verbose: boolean,
 ): Promise<string> {
   if (verbose) {
-    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 4 sources...`);
+    console.log(`[Word/Corroborate] Page ${pageNum}: reconciling 5 sources...`);
   }
 
   const textBody = [
@@ -193,6 +195,9 @@ async function corroboratePage(
     ``,
     `=== SOURCE 4: GLM-OCR EXTRACTION (visual OCR) ===`,
     glmOcrText || "(no text extracted by GLM-OCR)",
+    ``,
+    `=== SOURCE 5: CHANDRA-OCR EXTRACTION (visual OCR) ===`,
+    chandraOcrText || "(no text extracted by Chandra-OCR)",
     ``,
     `Using the page image above as visual ground truth, produce the single most accurate version of this page's text.`,
   ].join("\n");
@@ -225,9 +230,9 @@ async function corroboratePage(
   }
 
   // If the model returned something meaningful, use it. Otherwise fall back
-  // to the best single OCR source: prefer GLM > dots > DeepSeek > pdfjs.
+  // to the best single OCR source: prefer Chandra > GLM > dots > DeepSeek > pdfjs.
   if (result.length > 20) return result;
-  return glmOcrText || dotsOcrText || ocrText || pdfjsText;
+  return chandraOcrText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +247,7 @@ export interface ConvertPdfToWordArgs {
   ocrModelId: string;
   dotsOcrModelId: string;
   glmOcrModelId: string;
+  chandraOcrModelId: string;
   structurerModelId: string;
   verbose: boolean;
 }
@@ -262,6 +268,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
     ocrModelId,
     dotsOcrModelId,
     glmOcrModelId,
+    chandraOcrModelId,
     structurerModelId,
     verbose,
   } = args;
@@ -338,17 +345,15 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         }
       }
 
-      // ── Passes 2–4: Three OCR models run in parallel ─────────────────────
-      // DeepSeek-OCR, dots.ocr, and GLM-OCR are independent of each other,
-      // so we fire them all at once and wait for all results.
+      // ── Passes 2–5: Four OCR models run in parallel ──────────────────────
+      // All four are independent — fire at once, print as each finishes.
       let ocrText = "";
       let dotsOcrText = "";
       let glmOcrText = "";
+      let chandraOcrText = "";
 
       if (pageImage) {
-        // Print a header line, then each model prints its own result line the
-        // instant it finishes — output appears in completion order, not start order.
-        console.log(`       Extracting (3 OCR models in parallel):`);
+        console.log(`       Extracting (4 OCR models in parallel):`);
         const t0 = Date.now();
 
         function liveModel(label: string, p: Promise<string>): Promise<string> {
@@ -368,10 +373,11 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           );
         }
 
-        [ocrText, dotsOcrText, glmOcrText] = await Promise.all([
-          liveModel("DeepSeek-OCR", callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD)),
-          liveModel("dots.ocr",     callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD)),
-          liveModel("GLM-OCR",      callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,  verbose, OCR_SYSTEM_PROMPT_WORD)),
+        [ocrText, dotsOcrText, glmOcrText, chandraOcrText] = await Promise.all([
+          liveModel("DeepSeek-OCR",  callOcrModel(client, pageImage.base64, pageImage.mimeType, ocrModelId,        verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("dots.ocr",      callOcrModel(client, pageImage.base64, pageImage.mimeType, dotsOcrModelId,    verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("GLM-OCR",       callOcrModel(client, pageImage.base64, pageImage.mimeType, glmOcrModelId,     verbose, OCR_SYSTEM_PROMPT_WORD)),
+          liveModel("Chandra-OCR",   callOcrModel(client, pageImage.base64, pageImage.mimeType, chandraOcrModelId, verbose, OCR_SYSTEM_PROMPT_WORD)),
         ]);
       }
 
@@ -379,7 +385,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
       let corroborated: string;
       if (pageImage) {
         try {
-          process.stdout.write(`       Corroborating (4 sources)...`);
+          process.stdout.write(`       Corroborating (5 sources)...`);
           const corrobStart = Date.now();
           corroborated = await corroboratePage(
             client,
@@ -389,6 +395,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
             ocrText,
             dotsOcrText,
             glmOcrText,
+            chandraOcrText,
             pageImage,
             verbose,
           );
@@ -399,7 +406,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
           console.log(
             `       Corroboration error: ${corrobErr instanceof Error ? corrobErr.message : String(corrobErr)}`,
           );
-          corroborated = glmOcrText || dotsOcrText || ocrText || pdfjsText;
+          corroborated = chandraOcrText || glmOcrText || dotsOcrText || ocrText || pdfjsText;
         }
       } else {
         // No image available — fall back to the pdfjs text layer only
@@ -413,6 +420,7 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
         ocrText,
         dotsOcrText,
         glmOcrText,
+        chandraOcrText,
         gemmaText: "",   // kept for progress-file backward compatibility
         corroborated,
       };
