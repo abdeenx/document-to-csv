@@ -29,10 +29,14 @@ export const CliArgsSchema = z.object({
     .default(
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
     ),
+  qwenModel: z
+    .string()
+    .default("mlx-community/Qwen2.5-VL-7B-Instruct-8bit"),
   verbose: z.boolean().default(false),
   excel: z.boolean().default(false),
   word: z.boolean().default(false),
   enhance: z.boolean().default(false),
+  qwenWord: z.boolean().default(false),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
@@ -153,6 +157,27 @@ export const WordProgressSchema = z.object({
   ),
 });
 export type WordProgress = z.infer<typeof WordProgressSchema>;
+
+// ---------------------------------------------------------------------------
+// Qwen single-model pipeline progress tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Progress file for the Qwen2.5-VL single-pass PDF → Word pipeline.
+ * One entry per page containing the raw Qwen-extracted text.
+ */
+export const QwenProgressSchema = z.object({
+  version: z.literal(1),
+  pdfPath: z.string(),
+  totalPages: z.number().int().positive(),
+  pages: z.record(
+    z.string().regex(/^\d+$/),
+    z.object({
+      text: z.string(),
+    }),
+  ),
+});
+export type QwenProgress = z.infer<typeof QwenProgressSchema>;
 
 // ---------------------------------------------------------------------------
 
