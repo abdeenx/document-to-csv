@@ -459,3 +459,265 @@ export async function convertPdfToWord(args: ConvertPdfToWordArgs): Promise<void
   console.log(`    Document build:  ${docGenSec}s`);
   console.log(`    Total elapsed:   ${totalSec}s`);
 }
+
+// ---------------------------------------------------------------------------
+// Enhance mode
+// ---------------------------------------------------------------------------
+
+/** Minimum character length for an OCR result to be considered "substantial". */
+const SUBSTANTIAL_THRESHOLD = 20;
+
+function isSubstantial(text: string): boolean {
+  return text.trim().length > SUBSTANTIAL_THRESHOLD;
+}
+
+/**
+ * Enhance an existing conversion by re-running OCR on pages where fewer than
+ * 3 of the 4 OCR models produced substantial text.
+ *
+ * For each such page:
+ *   - Each weak model is retried up to MAX_RETRY_ATTEMPTS times.
+ *   - After retries the page is re-corroborated with whatever sources are
+ *     available (best-case scenario).
+ *   - Progress is saved after each improved page so the run is resumable.
+ *
+ * The Word document is regenerated from the updated progress file at the end.
+ *
+ * Backward compatible: existing progress files without `chandraOcrText` parse
+ * fine because the field defaults to "".
+ */
+export async function enhanceProgressFile(args: ConvertPdfToWordArgs): Promise<void> {
+  const {
+    pdfPath,
+    outputPath,
+    progressPath,
+    client,
+    ocrModelId,
+    dotsOcrModelId,
+    glmOcrModelId,
+    chandraOcrModelId,
+    structurerModelId,
+    verbose,
+  } = args;
+
+  const MAX_RETRY_ATTEMPTS = 3;
+  const MIN_SUBSTANTIAL_SOURCES = 3;
+
+  // ── Load existing progress file ───────────────────────────────────────────
+  console.log(`[Enhance] Progress file: ${progressPath}`);
+
+  if (!(await fileExists(progressPath))) {
+    console.error("[Enhance] No progress file found at the expected path.");
+    console.error("          Run the conversion first (--word) before using --enhance.");
+    process.exit(1);
+  }
+
+  let progress: WordProgress;
+  try {
+    const raw = JSON.parse(await readFile(progressPath, "utf-8")) as unknown;
+    const parsed = WordProgressSchema.safeParse(raw);
+    if (!parsed.success) {
+      console.error("[Enhance] Progress file failed validation:", parsed.error.message);
+      process.exit(1);
+    }
+    progress = parsed.data;
+  } catch {
+    console.error("[Enhance] Failed to read or parse progress file.");
+    process.exit(1);
+  }
+
+  const { totalPages } = progress;
+  const completedCount = Object.keys(progress.pages).length;
+
+  if (completedCount === 0) {
+    console.log("[Enhance] No completed pages in progress file — nothing to enhance.");
+    return;
+  }
+
+  console.log(`[Enhance] ${completedCount}/${totalPages} pages completed.`);
+  console.log("[Enhance] Scanning OCR coverage...");
+  console.log("");
+
+  // ── Require a renderer ────────────────────────────────────────────────────
+  const renderer: Renderer | null = await detectRenderer();
+  if (!renderer) {
+    console.error("[Enhance] No PDF renderer found (pdftoppm / mutool).");
+    console.error("          Install via: brew install poppler");
+    process.exit(1);
+  }
+
+  // OCR model definitions — order determines fallback priority
+  const ocrModels: Array<{ key: keyof PageExtraction; label: string; modelId: string }> = [
+    { key: "ocrText",        label: "DeepSeek-OCR", modelId: ocrModelId },
+    { key: "dotsOcrText",    label: "dots.ocr",     modelId: dotsOcrModelId },
+    { key: "glmOcrText",     label: "GLM-OCR",      modelId: glmOcrModelId },
+    { key: "chandraOcrText", label: "Chandra-OCR",  modelId: chandraOcrModelId },
+  ];
+
+  const tmpDir = join(tmpdir(), `doc2word-enhance-${randomUUID()}`);
+  await mkdir(tmpDir, { recursive: true });
+
+  const enhanceStart = Date.now();
+  let pagesImproved = 0;
+  let pagesAlreadyOk = 0;
+
+  try {
+    for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+      const pageKey = String(pageNum);
+      const pageData = progress.pages[pageKey];
+
+      if (!pageData) {
+        if (verbose) {
+          console.log(`[Enhance] Page ${pageNum}/${totalPages}: not yet extracted — skipping.`);
+        }
+        continue;
+      }
+
+      // ── Check how many OCR sources already have substantial text ──────────
+      const weakModels = ocrModels.filter(
+        (m) => !isSubstantial(pageData[m.key] as string),
+      );
+      const substantialCount = ocrModels.length - weakModels.length;
+
+      if (substantialCount >= MIN_SUBSTANTIAL_SOURCES) {
+        pagesAlreadyOk++;
+        if (verbose) {
+          console.log(
+            `[Enhance] Page ${pageNum}/${totalPages}: ${substantialCount}/4 sources OK — skipping.`,
+          );
+        }
+        continue;
+      }
+
+      console.log(
+        `[Enhance] Page ${pageNum}/${totalPages}: ${substantialCount}/4 OCR sources populated — enhancing...`,
+      );
+
+      // ── Render the page ───────────────────────────────────────────────────
+      let pageImage: { base64: string; mimeType: "image/jpeg" } | null = null;
+      try {
+        process.stdout.write(`         Rendering...`);
+        pageImage = await renderPageToJpeg(pdfPath, pageNum, renderer, tmpDir, verbose);
+        process.stdout.write(
+          ` done (${Math.round((pageImage.base64.length * 0.75) / 1024)} KB)\n`,
+        );
+      } catch (renderErr) {
+        process.stdout.write(` failed — skipping page\n`);
+        console.log(
+          `         Render error: ${renderErr instanceof Error ? renderErr.message : String(renderErr)}`,
+        );
+        continue;
+      }
+
+      // ── Retry each weak model up to MAX_RETRY_ATTEMPTS times ─────────────
+      const updatedData: PageExtraction = { ...pageData };
+      let anyImproved = false;
+
+      for (const model of weakModels) {
+        let gotSubstantial = false;
+        for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+          process.stdout.write(
+            `         Retrying ${model.label} (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})... `,
+          );
+          try {
+            const text = await callOcrModel(
+              client,
+              pageImage.base64,
+              pageImage.mimeType,
+              model.modelId,
+              verbose,
+              OCR_SYSTEM_PROMPT_WORD,
+            );
+            if (isSubstantial(text)) {
+              process.stdout.write(`✓  ${text.length} chars\n`);
+              updatedData[model.key] = text;
+              gotSubstantial = true;
+              anyImproved = true;
+              break;
+            } else {
+              process.stdout.write(`✗  ${text.length} chars (too short)\n`);
+            }
+          } catch (ocrErr) {
+            const msg =
+              ocrErr instanceof Error ? ocrErr.message.slice(0, 80) : String(ocrErr);
+            process.stdout.write(`✗  error: ${msg}\n`);
+          }
+        }
+        if (!gotSubstantial && verbose) {
+          console.log(
+            `         ${model.label}: could not get substantial text after ${MAX_RETRY_ATTEMPTS} attempts.`,
+          );
+        }
+      }
+
+      // ── Re-corroborate with whatever we now have ──────────────────────────
+      const newSubstantialCount = ocrModels.filter(
+        (m) => isSubstantial(updatedData[m.key] as string),
+      ).length;
+      console.log(
+        `         → ${newSubstantialCount}/4 sources populated. Re-corroborating...`,
+      );
+
+      try {
+        const corrStart = Date.now();
+        const corroborated = await corroboratePage(
+          client,
+          structurerModelId,
+          pageNum,
+          updatedData.pdfjsText,
+          updatedData.ocrText,
+          updatedData.dotsOcrText,
+          updatedData.glmOcrText,
+          updatedData.chandraOcrText,
+          pageImage,
+          verbose,
+        );
+        const corrSec = ((Date.now() - corrStart) / 1000).toFixed(1);
+        process.stdout.write(
+          `         ✓ Corroborated (${corroborated.length} chars, ${corrSec}s)\n`,
+        );
+        updatedData.corroborated = corroborated;
+        anyImproved = true;
+      } catch (corrobErr) {
+        const msg =
+          corrobErr instanceof Error ? corrobErr.message.slice(0, 80) : String(corrobErr);
+        console.log(`         Corroboration failed: ${msg} — keeping existing text.`);
+      }
+
+      // ── Persist after each improved page (resumable) ─────────────────────
+      if (anyImproved) {
+        progress.pages[pageKey] = updatedData;
+        await saveProgress(progressPath, progress);
+        pagesImproved++;
+      }
+    }
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+
+  console.log("");
+  console.log(
+    `[Enhance] Complete. ${pagesImproved} page(s) improved, ${pagesAlreadyOk} page(s) already had sufficient coverage.`,
+  );
+  console.log("");
+
+  // ── Regenerate Word document from updated progress ────────────────────────
+  console.log("[Enhance] Regenerating Word document...");
+  const docGenStart = Date.now();
+  const orderedPages = Array.from({ length: totalPages }, (_, i) => ({
+    pageNum: i + 1,
+    text: progress.pages[String(i + 1)]?.corroborated ?? "",
+  }));
+  await generateWordDoc(orderedPages, outputPath, verbose);
+  const docGenSec = ((Date.now() - docGenStart) / 1000).toFixed(1);
+  const totalSec = ((Date.now() - enhanceStart) / 1000).toFixed(1);
+
+  console.log("");
+  console.log("Done!");
+  console.log(`  Word document:  ${outputPath}`);
+  console.log(`  Progress file:  ${progressPath}`);
+  console.log("");
+  console.log(`  Timing:`);
+  console.log(`    Document build:  ${docGenSec}s`);
+  console.log(`    Total elapsed:   ${totalSec}s`);
+}
