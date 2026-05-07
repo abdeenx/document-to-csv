@@ -47,7 +47,7 @@ import { extractTextWithOcr } from "./ocr.js";
 import { extractTextFromPdf, extractPdfPageLayouts } from "./pdf.js";
 import { verifyDocumentWithGemma, generateCsvWithGemma } from "./csv-generator.js";
 import { generateExcel } from "./excel-generator.js";
-import { convertPdfToWord } from "./pdf-to-word.js";
+import { convertPdfToWord, enhanceProgressFile } from "./pdf-to-word.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -59,6 +59,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       output:             { type: "string",  short: "o" },
       excel:              { type: "boolean", default: false },
       word:               { type: "boolean", default: false },
+      enhance:            { type: "boolean", default: false },
       "lm-studio-url":      { type: "string" },
       "ocr-model":          { type: "string" },
       "dots-ocr-model":     { type: "string" },
@@ -78,6 +79,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
 
   if (values.excel && values.word) {
     console.error("Error: --excel and --word are mutually exclusive. Choose one.");
+    process.exit(1);
+  }
+
+  if (values.enhance && !values.word) {
+    console.error("Error: --enhance requires --word.");
     process.exit(1);
   }
 
@@ -114,9 +120,10 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     chandraOcrModel: values["chandra-ocr-model"]  ?? "jwindle47/chandra-ocr-2-8bit-mlx",
     structurerModel: values["structurer-model"]  ??
       "zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine",
-    verbose: values.verbose ?? false,
-    excel:   values.excel   ?? false,
-    word:    values.word    ?? false,
+    verbose: values.verbose  ?? false,
+    excel:   values.excel    ?? false,
+    word:    values.word     ?? false,
+    enhance: values.enhance  ?? false,
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -177,6 +184,7 @@ Examples:
   pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --excel --verbose
   pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word
   pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word --verbose
+  pnpm --filter @workspace/scripts run document-to-csv ./contract.pdf --word --enhance
   pnpm --filter @workspace/scripts run document-to-csv ./report.pdf --output ./data/report.xlsx --excel
 `);
 }
@@ -185,11 +193,12 @@ async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
 
-  // ── Mode 3: PDF → Word ────────────────────────────────────────────────────
+  // ── Mode 3: PDF → Word (normal or enhance) ───────────────────────────────
   if (args.word) {
     const progressPath = args.outputPath!.replace(/\.docx$/i, ".progress.json");
 
-    console.log("document-to-csv (PDF → Word mode)");
+    const modeLabel = args.enhance ? "PDF → Word (enhance mode)" : "PDF → Word mode";
+    console.log(`document-to-csv (${modeLabel})`);
     console.log("==================================");
     console.log(`  Input:          ${args.imagePath}`);
     console.log(`  Output:         ${args.outputPath}`);
@@ -204,7 +213,7 @@ async function main(): Promise<void> {
 
     const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
 
-    await convertPdfToWord({
+    const wordArgs = {
       pdfPath:            args.imagePath,
       outputPath:         args.outputPath!,
       progressPath,
@@ -215,7 +224,13 @@ async function main(): Promise<void> {
       chandraOcrModelId:  args.chandraOcrModel,
       structurerModelId:  args.structurerModel,
       verbose:            args.verbose,
-    });
+    };
+
+    if (args.enhance) {
+      await enhanceProgressFile(wordArgs);
+    } else {
+      await convertPdfToWord(wordArgs);
+    }
 
     return;
   }
