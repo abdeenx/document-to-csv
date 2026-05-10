@@ -32,11 +32,17 @@ export const CliArgsSchema = z.object({
   qwenModel: z
     .string()
     .default("mlx-community/Qwen2.5-VL-7B-Instruct-8bit"),
+  qwen3Model: z
+    .string()
+    .default("qwen/qwen3-vl-8b"),
   verbose: z.boolean().default(false),
   excel: z.boolean().default(false),
   word: z.boolean().default(false),
   enhance: z.boolean().default(false),
   qwenWord: z.boolean().default(false),
+  qwen3Word: z.boolean().default(false),
+  qwen3Review: z.boolean().default(false),
+  reviewWordPath: z.string().optional(),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
@@ -163,9 +169,24 @@ export type WordProgress = z.infer<typeof WordProgressSchema>;
 // ---------------------------------------------------------------------------
 
 /**
- * Progress file for the Qwen2.5-VL single-pass PDF → Word pipeline.
- * One entry per page containing the raw Qwen-extracted text.
+ * Progress file for the Qwen3-VL review pipeline (PDF + Word → corrected Word).
+ * One entry per page storing both the original Word text and the corrected version.
  */
+export const Qwen3ReviewProgressSchema = z.object({
+  version: z.literal(1),
+  pdfPath: z.string(),
+  wordPath: z.string(),
+  totalPages: z.number().int().positive(),
+  pages: z.record(
+    z.string().regex(/^\d+$/),
+    z.object({
+      wordText: z.string(),
+      correctedText: z.string(),
+    }),
+  ),
+});
+export type Qwen3ReviewProgress = z.infer<typeof Qwen3ReviewProgressSchema>;
+
 export const QwenProgressSchema = z.object({
   version: z.literal(1),
   pdfPath: z.string(),
