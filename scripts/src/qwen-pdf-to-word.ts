@@ -210,6 +210,8 @@ export interface QwenConvertArgs {
   progressPath: string;
   client: OpenAI;
   qwenModelId: string;
+  /** Display label used in log lines, e.g. "Qwen2.5-VL" or "Qwen3-VL". */
+  modelLabel?: string;
   verbose: boolean;
 }
 
@@ -219,6 +221,7 @@ export interface QwenConvertArgs {
  */
 export async function convertPdfToWordWithQwen(args: QwenConvertArgs): Promise<void> {
   const { pdfPath, outputPath, progressPath, client, qwenModelId, verbose } = args;
+  const modelLabel = args.modelLabel ?? "Qwen VL";
 
   const docStart = Date.now();
 
@@ -299,7 +302,7 @@ export async function convertPdfToWordWithQwen(args: QwenConvertArgs): Promise<v
           let inferMs = 0;
           if (pageImage) {
             const t = Date.now();
-            process.stdout.write(`         ${fmtClock(t)}  Qwen2.5-VL inference...`);
+            process.stdout.write(`         ${fmtClock(t)}  ${modelLabel} inference...`);
             try {
               text = await extractPageWithQwen(client, qwenModelId, pageNum, pageImage, verbose);
               inferMs = Date.now() - t;
