@@ -3,29 +3,44 @@
  *
  * PDF → EPUB pipeline using Qwen3-VL.
  *
- * For each page the model is asked to return a clean HTML5 fragment
- * (headings, paragraphs, tables, lists) with dir="rtl"/"ltr" attributes
- * on every block element. The fragments are assembled into a standard
- * EPUB 3 file by epub-generator.ts — one XHTML file per PDF page —
- * making it straightforward for a human reviewer to open any page,
- * compare it against the source PDF, and edit the HTML directly.
+ * For every page the model returns a SINGLE HTML fragment that combines
+ * text elements AND visual elements in natural reading order.
+ * Visual content (covers, illustrations, inline images) is represented as:
+ *
+ *   <figure data-region="x1,y1,x2,y2">
+ *     <figcaption dir="rtl">optional caption</figcaption>
+ *   </figure>
+ *
+ * where x1,y1 / x2,y2 are the top-left / bottom-right corners of the visual
+ * element expressed as percentages of the page (0–100).
+ *
+ * After the model responds, processInlineImages() uses sharp to crop each
+ * declared region from the rendered JPEG, saves the crop to the images
+ * directory, and rewrites the figure to contain a proper <img> element.
+ * Regions that cover ≥ 90% of the page get class="page-image";
+ * smaller embedded visuals get class="inline-image".
+ *
+ * The final, processed HTML (with real <img> tags) is stored in the progress
+ * file. The images directory persists across resume cycles.
  *
  * Pipeline per page:
- *   1. Render page to JPEG (pdftoppm / mutool)
- *   2. Qwen3-VL returns an HTML fragment for the page
- *   3. Clean and normalise the fragment (strip fences, fix void elements)
- *   4. Save to progress file (resumable)
+ *   1. Render PDF page to JPEG  (pdftoppm / mutool)
+ *   2. Qwen3-VL → HTML fragment (text + <figure data-region="…"> for visuals)
+ *   3. processInlineImages()    (sharp crops; rewrites figures with <img>)
+ *   4. Save processed HTML to progress file
  *
- * After all pages: assemble the EPUB package via generateEpub().
+ * After all pages: assemble the EPUB via generateEpub().
  *
- * Progress file: <output>.epub-progress.json
- * Delete it to force a full re-run.
+ * Progress file:   <output>.epub-progress.json
+ * Images folder:   <output>.epub-images/
+ * Delete both to force a full re-run.
  */
 
 import { readFile, writeFile, mkdir, rm, access } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import sharp from "sharp";
 import type OpenAI from "openai";
 import type { ChatCompletionContentPart } from "openai/resources/chat/completions";
 import {
@@ -46,56 +61,168 @@ const EPUB_SYSTEM_PROMPT = [
   "You are a document page-to-HTML converter specializing in Arabic and Latin text.",
   "Your output will be embedded directly into an EPUB XHTML page file.",
   "",
-  "──────────────────────────────────────────────────────────────────",
-  "STEP 1 — CLASSIFY THE PAGE (do this first, before anything else):",
-  "──────────────────────────────────────────────────────────────────",
-  "If the page is primarily a full-page image with NO significant readable text",
-  "(e.g. book cover, decorative illustration, photograph, full-page diagram,",
-  "ornamental page), output EXACTLY the following single line — nothing else:",
+  "Convert the document page to a single HTML5 fragment that captures ALL content",
+  "— text AND visuals — in natural reading order (top to bottom, right to left for Arabic).",
   "",
-  "  IMAGE_ONLY",
+  "═══════════════════════════════════════════════════════════",
+  "VISUAL ELEMENTS  (images, illustrations, photos, maps, diagrams, decorative art)",
+  "═══════════════════════════════════════════════════════════",
+  "For EVERY visual element on the page, insert a <figure> at the correct reading",
+  "position relative to any surrounding text:",
   "",
-  "Do NOT output IMAGE_ONLY if the page contains any readable text content",
-  "(even if the text is overlaid on an image or decorative background).",
+  "  <figure data-region=\"x1,y1,x2,y2\">",
+  "    <figcaption dir=\"rtl\">caption text if visible in the image</figcaption>",
+  "  </figure>",
   "",
-  "──────────────────────────────────────────────────────────────────",
-  "STEP 2 — FOR TEXT PAGES: produce an HTML fragment",
-  "──────────────────────────────────────────────────────────────────",
-  "Convert the document page to a clean HTML5 content fragment.",
+  "• x1,y1 = top-left corner of the visual element",
+  "• x2,y2 = bottom-right corner of the visual element",
+  "• All four values are INTEGER PERCENTAGES of the page dimensions (0–100).",
+  "• Include a <figcaption> only if a caption is actually printed on the page.",
   "",
-  "STRICT OUTPUT FORMAT:",
-  "- Output ONLY the HTML content — no <html>, <head>, <body>, or <!DOCTYPE> tags.",
-  "- No markdown fences (` ``` `), no XML declarations, no reasoning traces.",
+  "Examples:",
+  "  Full-page cover with no text:  <figure data-region=\"0,0,100,100\"></figure>",
+  "  Illustration in the top half:  <figure data-region=\"5,5,95,50\"></figure>",
+  "  Small map embedded in text:    <figure data-region=\"10,40,60,65\"></figure>",
   "",
-  "ELEMENTS TO USE (use only these):",
-  "  Headings:   <h2 dir=\"rtl\"> main title/chapter head | <h3 dir=\"rtl\"> sub-heading",
-  "              (use dir=\"ltr\" for Latin-only headings)",
-  "  Paragraphs: <p dir=\"rtl\"> Arabic  |  <p dir=\"ltr\"> Latin/English/numbers",
-  "  Tables:     <table><thead><tr><th dir=\"rtl\">…</th></tr></thead>",
-  "                     <tbody><tr><td dir=\"rtl\">…</td></tr></tbody></table>",
-  "  Lists:      <ul dir=\"rtl\"><li>…</li></ul>  or  <ol dir=\"rtl\"><li>…</li></ol>",
-  "  Key-value:  <p dir=\"rtl\"><strong>Key:</strong> Value</p>",
-  "  Divider:    <hr/>",
+  "Include <figure> elements for: covers, illustrations, photographs, maps,",
+  "diagrams, charts, ornamental borders/dividers, and any other non-text visual.",
   "",
-  "DIRECTION (required on EVERY block element):",
-  "  dir=\"rtl\" — any element containing Arabic characters",
-  "  dir=\"ltr\" — any element with only Latin, English, or numeric content",
+  "═══════════════════════════════════════════════════════════",
+  "TEXT ELEMENTS",
+  "═══════════════════════════════════════════════════════════",
+  "Use only these elements:",
+  "  <h2 dir=\"rtl\"> / <h2 dir=\"ltr\">   main headings",
+  "  <h3 dir=\"rtl\"> / <h3 dir=\"ltr\">   sub-headings",
+  "  <p  dir=\"rtl\"> / <p  dir=\"ltr\">   paragraphs",
+  "  <table> with <thead>/<tbody>, <tr>, <th dir=\"rtl\">, <td dir=\"rtl\">",
+  "  <ul dir=\"rtl\"><li>…</li></ul>   or  <ol dir=\"rtl\"><li>…</li></ol>",
+  "  <hr/>   decorative rule (text only, not for visual replacements)",
   "",
-  "ACCURACY (non-negotiable):",
-  "  - Reproduce every Arabic character exactly as visible in the image.",
-  "  - Reproduce every Latin character, number, and punctuation mark exactly.",
-  "  - Do NOT translate, transliterate, paraphrase, or summarize anything.",
+  "DIRECTION on every block element (required):",
+  "  dir=\"rtl\" — element contains Arabic characters",
+  "  dir=\"ltr\" — element contains only Latin / numeric content",
+  "",
+  "═══════════════════════════════════════════════════════════",
+  "OUTPUT FORMAT",
+  "═══════════════════════════════════════════════════════════",
+  "• HTML content ONLY — no <html>, <head>, <body>, <!DOCTYPE>, no markdown fences.",
+  "• No reasoning traces, no XML declarations.",
+  "• Reproduce every Arabic character exactly as visible.",
+  "• Reproduce every Latin character, number, and punctuation exactly.",
+  "• Do NOT translate, transliterate, paraphrase, or summarize.",
 ].join("\n");
 
-/** Returns true when the model indicates the page is a full-page image. */
-function isImageOnlyResponse(raw: string): boolean {
-  return /^IMAGE_ONLY\s*$/i.test(raw.trim());
+// ---------------------------------------------------------------------------
+// Image region helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse "x1,y1,x2,y2" (percentages) into normalised [0,1] fractions.
+ * Returns null if the string is invalid.
+ */
+function parseRegion(
+  attr: string,
+): { left: number; top: number; width: number; height: number } | null {
+  const parts = attr.split(",").map((s) => parseFloat(s.trim()));
+  if (parts.length !== 4 || parts.some(isNaN)) return null;
+  const [x1r, y1r, x2r, y2r] = parts as [number, number, number, number];
+  const x1 = Math.max(0, Math.min(99, x1r));
+  const y1 = Math.max(0, Math.min(99, y1r));
+  const x2 = Math.max(x1 + 1, Math.min(100, x2r));
+  const y2 = Math.max(y1 + 1, Math.min(100, y2r));
+  return {
+    left:   x1 / 100,
+    top:    y1 / 100,
+    width:  (x2 - x1) / 100,
+    height: (y2 - y1) / 100,
+  };
 }
 
 /**
- * Directory where rendered JPEGs are stored for image-only pages.
+ * Find all <figure data-region="…">…</figure> blocks in `html`.
+ * For each one:
+ *   • Crop the declared rectangle from the page JPEG using sharp.
+ *   • Save the crop to `<imgFolder>/page_NNN_imgM.jpg`.
+ *   • Replace the data-region figure with a proper <figure><img…/></figure>.
+ *   • Regions covering ≥ 90% of the page in both dimensions → class="page-image".
+ *   • Smaller regions → class="inline-image".
+ *
+ * Returns the processed HTML and the number of images successfully extracted.
+ */
+async function processInlineImages(
+  html: string,
+  pageJpegBase64: string,
+  pageNum: number,
+  imgFolder: string,
+): Promise<{ html: string; count: number }> {
+  const figRe = /<figure([^>]*?)data-region="([^"]+)"([^>]*)>([\s\S]*?)<\/figure>/gi;
+  const matches = [...html.matchAll(figRe)];
+  if (matches.length === 0) return { html, count: 0 };
+
+  await mkdir(imgFolder, { recursive: true });
+  const jpegBuffer = Buffer.from(pageJpegBase64, "base64");
+  const meta = await sharp(jpegBuffer).metadata();
+  const imgW = meta.width  ?? 1000;
+  const imgH = meta.height ?? 1000;
+
+  let result = html;
+  let imgIndex = 0;
+  let successCount = 0;
+
+  for (const match of matches) {
+    const fullBlock  = match[0]!;
+    const regionStr  = match[2]!;
+    const innerRaw   = (match[4] ?? "").trim();
+
+    const region = parseRegion(regionStr);
+    if (!region) {
+      console.log(`         Warning: invalid data-region "${regionStr}" on page ${pageNum} — skipping.`);
+      continue;
+    }
+
+    imgIndex++;
+    const imgName = `page_${String(pageNum).padStart(3, "0")}_img${imgIndex}.jpg`;
+    const imgPath = join(imgFolder, imgName);
+
+    // Pixel coordinates (clamped to image bounds)
+    const left   = Math.max(0, Math.round(region.left  * imgW));
+    const top    = Math.max(0, Math.round(region.top   * imgH));
+    const width  = Math.max(1, Math.min(imgW - left, Math.round(region.width  * imgW)));
+    const height = Math.max(1, Math.min(imgH - top,  Math.round(region.height * imgH)));
+
+    // A region covering ≥ 90% of the page in both dimensions is "full-page"
+    const isFullPage = region.width >= 0.9 && region.height >= 0.9;
+    const figClass   = isFullPage ? "page-image" : "inline-image";
+
+    try {
+      await sharp(jpegBuffer)
+        .extract({ left, top, width, height })
+        .jpeg({ quality: 88 })
+        .toFile(imgPath);
+
+      const imgEl   = `<img src="images/${imgName}" alt="illustration page ${pageNum}"/>`;
+      const caption = innerRaw ? `\n  ${innerRaw}` : "";
+      const newBlock = `<figure class="${figClass}">\n  ${imgEl}${caption}\n</figure>`;
+
+      // Use a replacer function so $ in newBlock is treated literally
+      result = result.replace(fullBlock, () => newBlock);
+      successCount++;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`         Warning: crop failed for page ${pageNum} img ${imgIndex}: ${msg}`);
+      // Keep the figure but without <img> so the human reviewer can see the placeholder
+      const fallback = `<figure class="${figClass}">\n  <!-- crop failed: ${msg} -->${innerRaw ? "\n  " + innerRaw : ""}\n</figure>`;
+      result = result.replace(fullBlock, () => fallback);
+    }
+  }
+
+  return { html: result, count: successCount };
+}
+
+/**
+ * Directory where cropped JPEGs are stored.
  * Lives alongside the progress file so it survives resume cycles.
- * e.g.  /path/to/book.epub-progress.json  →  /path/to/book.epub-images/
+ *   /path/to/book.epub-progress.json  →  /path/to/book.epub-images/
  */
 function imagesDir(progressPath: string): string {
   return progressPath.replace(/\.epub-progress\.json$/i, ".epub-images");
@@ -167,10 +294,10 @@ async function saveProgress(path: string, p: EpubProgress): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Single-page Qwen3 HTML extraction
+// Single-page Qwen3 extraction
 // ---------------------------------------------------------------------------
 
-async function extractPageHtml(
+async function extractPageRaw(
   client: OpenAI,
   modelId: string,
   pageNum: number,
@@ -204,7 +331,7 @@ async function extractPageHtml(
 
   if (verbose) {
     const tokens = response.usage?.total_tokens ?? "?";
-    console.log(`[EPUB] Page ${pageNum}: ${html.length} chars, ${tokens} tokens`);
+    console.log(`[EPUB] Page ${pageNum}: raw ${html.length} chars, ${tokens} tokens`);
   }
 
   return html;
@@ -224,12 +351,17 @@ export interface QwenEpubArgs {
 }
 
 /**
- * Convert a PDF to an EPUB using Qwen3-VL for per-page HTML extraction.
+ * Convert a PDF to an EPUB using Qwen3-VL for per-page extraction.
+ *
+ * Text and visual content are extracted together. Visuals declared by the
+ * model with <figure data-region="…"> are cropped from the rendered JPEG
+ * using sharp and embedded as real images in the EPUB.
+ *
  * Progress is saved after every page — fully resumable.
  */
 export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
   const { pdfPath, outputPath, progressPath, client, modelId, verbose } = args;
-
+  const imgDir = imagesDir(progressPath);
   const docStart = Date.now();
 
   // ── Step 1: count pages ───────────────────────────────────────────────────
@@ -240,7 +372,6 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
     process.stdout.write(` done  ${fmtSec(Date.now() - t0)}  (${numPages} page(s))\n`);
     console.log("");
 
-    // ── Load progress ───────────────────────────────────────────────────────
     const progress = await loadProgress(progressPath, pdfPath, numPages);
 
     // ── Detect renderer ─────────────────────────────────────────────────────
@@ -253,7 +384,7 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
       } else {
         process.stdout.write(` none found  ${fmtSec(Date.now() - tr)}\n`);
         console.log("         Warning: No PDF renderer (pdftoppm / mutool).");
-        console.log("         OCR pass skipped — pages will be empty.");
+        console.log("         OCR and image extraction skipped — pages will be empty.");
         console.log("         Install: brew install poppler");
       }
       console.log("");
@@ -296,42 +427,43 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
             }
           }
 
-          // ── Qwen3 extraction / image detection ─────────────────────────────
+          // ── Qwen3 extraction ───────────────────────────────────────────────
           let html = "";
-          let pageIsImage = false;
           let inferMs = 0;
+          let imgCount = 0;
+          let imgMs = 0;
+
           if (pageImage) {
+            // Step A: model produces HTML with <figure data-region="…"> for visuals
             const t = Date.now();
-            process.stdout.write(`         ${fmtClock(t)}  Qwen3-VL → classify + extract...`);
+            process.stdout.write(`         ${fmtClock(t)}  Qwen3-VL → HTML + figures...`);
             try {
-              const raw = await extractPageHtml(client, modelId, pageNum, pageImage, verbose);
-
-              if (isImageOnlyResponse(raw)) {
-                // ── Image page: save JPEG to the images folder ──────────────
-                pageIsImage = true;
-                inferMs = Date.now() - t;
-                process.stdout.write(` IMAGE  ${fmtSec(inferMs)}\n`);
-
-                const imgFolder = imagesDir(progressPath);
-                await mkdir(imgFolder, { recursive: true });
-                const imgName = `page_${String(pageNum).padStart(3, "0")}.jpg`;
-                await writeFile(
-                  join(imgFolder, imgName),
-                  Buffer.from(pageImage.base64, "base64"),
-                );
-                console.log(`         Saved: ${imgFolder}/${imgName}`);
-                html = "";
-              } else {
-                // ── Text page: clean and keep the HTML fragment ─────────────
-                html = cleanHtmlFragment(raw);
-                inferMs = Date.now() - t;
-                process.stdout.write(` done  ${fmtSec(inferMs)}  (${html.length} chars)\n`);
-              }
+              const raw = await extractPageRaw(client, modelId, pageNum, pageImage, verbose);
+              html = cleanHtmlFragment(raw);
+              inferMs = Date.now() - t;
+              process.stdout.write(` done  ${fmtSec(inferMs)}  (${html.length} chars)\n`);
             } catch (err) {
               inferMs = Date.now() - t;
               process.stdout.write(` failed  ${fmtSec(inferMs)}\n`);
               console.log(`         Error: ${err instanceof Error ? err.message : String(err)}`);
               html = `<p dir="rtl"><!-- extraction failed for page ${pageNum} --></p>`;
+            }
+
+            // Step B: crop declared image regions using sharp
+            if (html.includes("data-region=")) {
+              const ti = Date.now();
+              process.stdout.write(`         ${fmtClock(ti)}  Cropping image regions...`);
+              try {
+                const result = await processInlineImages(html, pageImage.base64, pageNum, imgDir);
+                html = result.html;
+                imgCount = result.count;
+                imgMs = Date.now() - ti;
+                process.stdout.write(` done  ${fmtSec(imgMs)}  (${imgCount} image(s))\n`);
+              } catch (err) {
+                imgMs = Date.now() - ti;
+                process.stdout.write(` failed  ${fmtSec(imgMs)}\n`);
+                console.log(`         Error: ${err instanceof Error ? err.message : String(err)}`);
+              }
             }
           } else {
             html = `<p dir="rtl"><!-- no renderer — page ${pageNum} skipped --></p>`;
@@ -342,9 +474,7 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
           {
             const t = Date.now();
             process.stdout.write(`         ${fmtClock(t)}  Saving progress...`);
-            progress.pages[pageKey] = pageIsImage
-              ? { html: "", imageOnly: true }
-              : { html };
+            progress.pages[pageKey] = { html };
             await saveProgress(progressPath, progress);
             const saveMs = Date.now() - t;
             process.stdout.write(` done  ${fmtSec(saveMs)}\n`);
@@ -353,26 +483,19 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
           // ── Page summary + ETA ──────────────────────────────────────────────
           const pageMs = Date.now() - pageStart;
           pageTimes.push(pageMs);
-
           const avgMs = pageTimes.reduce((a, b) => a + b, 0) / pageTimes.length;
           const remaining = numPages - pageNum;
 
           console.log(`         ${DIVIDER}`);
           const parts = [
             `render ${fmtSec(renderMs)}`,
-            pageIsImage ? `image detected` : `inference ${fmtSec(inferMs)}`,
+            `inference ${fmtSec(inferMs)}`,
+            ...(imgCount > 0 ? [`${imgCount} image(s) ${fmtSec(imgMs)}`] : []),
           ];
-
+          console.log(`         Page ${pageNum} done in ${fmtSec(pageMs)}  [${parts.join("  ·  ")}]`);
           if (remaining > 0) {
             console.log(
-              `         Page ${pageNum} done in ${fmtSec(pageMs)}  [${parts.join("  ·  ")}]`,
-            );
-            console.log(
               `         avg ${fmtSec(avgMs)}/page  ·  ${remaining} page(s) remaining  ·  ETA ${fmtEta(avgMs * remaining)}`,
-            );
-          } else {
-            console.log(
-              `         Page ${pageNum} done in ${fmtSec(pageMs)}  [${parts.join("  ·  ")}]`,
             );
           }
           console.log("");
@@ -386,23 +509,12 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
         const t = Date.now();
         process.stdout.write(`[EPUB] ${fmtClock(t)}  Assembling EPUB package...`);
 
-        const orderedPages = Array.from({ length: numPages }, (_, i) => {
-          const entry = progress.pages[String(i + 1)];
-          return {
-            pageNum: i + 1,
-            html: entry?.html ?? "",
-            imageOnly: entry?.imageOnly ?? false,
-          };
-        });
+        const orderedPages = Array.from({ length: numPages }, (_, i) => ({
+          pageNum: i + 1,
+          html: progress.pages[String(i + 1)]?.html ?? "",
+        }));
 
-        const hasImagePages = orderedPages.some((p) => p.imageOnly);
-        await generateEpub(
-          orderedPages,
-          outputPath,
-          pdfPath,
-          hasImagePages ? imagesDir(progressPath) : null,
-          verbose,
-        );
+        await generateEpub(orderedPages, outputPath, pdfPath, imgDir, verbose);
         const buildMs = Date.now() - t;
         process.stdout.write(` done  ${fmtSec(buildMs)}\n`);
       }
@@ -419,8 +531,9 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
       console.log(`${"═".repeat(56)}`);
       console.log(`  Done!`);
       console.log(`  EPUB:            ${outputPath}`);
+      console.log(`  Images folder:   ${imgDir}`);
       console.log(`  Progress file:   ${progressPath}`);
-      console.log(`  (Delete progress file to re-convert from scratch.)`);
+      console.log(`  (Delete both to re-convert from scratch.)`);
       console.log("");
       console.log(`  Pages:           ${processed} extracted of ${numPages}`);
       console.log(`  Avg per page:    ${avgPerPage}`);
