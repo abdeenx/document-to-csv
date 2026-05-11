@@ -23,8 +23,8 @@
  * side-by-side, then edit the HTML directly and re-pack as an EPUB.
  */
 
-import { writeFile, mkdir } from "node:fs/promises";
-import { dirname, basename, extname } from "node:path";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname, basename, extname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import JSZip from "jszip";
 
@@ -133,6 +133,27 @@ hr {
 .ltr { direction: ltr; text-align: left; }
 .center { text-align: center; }
 .bold { font-weight: bold; }
+
+/* Full-page images (covers, illustrations) */
+.page-image {
+  margin: 0;
+  padding: 0;
+  text-align: center;
+}
+
+.page-image img {
+  max-width: 100%;
+  max-height: 95vh;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+.page-image figcaption {
+  font-size: 0.85em;
+  color: #666;
+  margin-top: 0.4em;
+}
 `;
 
 // ---------------------------------------------------------------------------
@@ -152,16 +173,34 @@ function buildContainer(): string {
 }
 
 function buildOpf(
-  pages: Array<{ pageNum: number }>,
+  pages: Array<{ pageNum: number; imageOnly?: boolean }>,
   title: string,
   uuid: string,
 ): string {
+  // Determine the first image-only page (gets cover-image property)
+  const firstImagePage = pages.find((p) => p.imageOnly)?.pageNum ?? -1;
+
+  // Image manifest items
+  const imageItems = pages
+    .filter((p) => p.imageOnly)
+    .map(({ pageNum }) => {
+      const imgFile = pageFileName(pageNum).replace(".xhtml", ".jpg");
+      const isCover = pageNum === firstImagePage;
+      return (
+        `    <item id="img_${pageId(pageNum)}" href="images/${imgFile}"` +
+        ` media-type="image/jpeg"` +
+        (isCover ? ` properties="cover-image"` : ``) +
+        `/>`
+      );
+    });
+
   const manifest = [
     `    <item id="nav" href="nav.xhtml"`,
     `          media-type="application/xhtml+xml" properties="nav"/>`,
     `    <item id="ncx" href="toc.ncx"`,
     `          media-type="application/x-dtbncx+xml"/>`,
     `    <item id="css" href="style.css" media-type="text/css"/>`,
+    ...imageItems,
     ...pages.map(
       ({ pageNum }) =>
         `    <item id="${pageId(pageNum)}" href="${pageFileName(pageNum)}"` +
@@ -267,7 +306,21 @@ function buildPageXhtml(
   totalPages: number,
   html: string,
   title: string,
+  imageOnly?: boolean,
 ): string {
+  const body = imageOnly
+    ? [
+        `  <!-- PDF page ${pageNum} of ${totalPages} — image -->`,
+        `  <figure class="page-image">`,
+        `    <img src="images/${pageFileName(pageNum).replace(".xhtml", ".jpg")}"`,
+        `         alt="Page ${pageNum} illustration"/>`,
+        `  </figure>`,
+      ].join("\n")
+    : [
+        `  <!-- PDF page ${pageNum} of ${totalPages} -->`,
+        `  ${html.trim()}`,
+      ].join("\n");
+
   return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<!DOCTYPE html>`,
@@ -280,8 +333,7 @@ function buildPageXhtml(
     `  <link rel="stylesheet" type="text/css" href="style.css"/>`,
     `</head>`,
     `<body>`,
-    `  <!-- PDF page ${pageNum} of ${totalPages} -->`,
-    `  ${html.trim()}`,
+    body,
     `</body>`,
     `</html>`,
   ].join("\n");
@@ -361,29 +413,46 @@ export function cleanHtmlFragment(raw: string): string {
 
 export interface EpubPage {
   pageNum: number;
+  /** Extracted HTML fragment (text pages) or empty string (image-only pages). */
   html: string;
+  /**
+   * When true, the page is a full-page image (cover, illustration).
+   * The JPEG must exist at `<imagesDir>/page_NNN.jpg`.
+   * The XHTML file will contain an `<img>` instead of the extracted HTML.
+   */
+  imageOnly?: boolean;
 }
 
 /**
- * Assemble an EPUB 3 file from per-page HTML fragments.
+ * Assemble an EPUB 3 file from per-page HTML fragments and/or images.
  *
- * @param pages     Ordered array of { pageNum, html } — html is a raw HTML fragment.
- * @param outputPath  Destination .epub file path.
- * @param pdfPath   Source PDF path (used to derive the book title).
- * @param verbose   If true, log progress to stdout.
+ * @param pages      Ordered array of { pageNum, html, imageOnly? }.
+ *                   For image-only pages the JPEG must exist at
+ *                   `<imagesDir>/page_NNN.jpg`.
+ * @param outputPath Destination .epub file path.
+ * @param pdfPath    Source PDF path (used to derive the book title).
+ * @param imagesDir  Directory containing `page_NNN.jpg` files for image-only pages.
+ *                   Pass `null` / `undefined` when no image pages exist.
+ * @param verbose    If true, log progress to stdout.
  */
 export async function generateEpub(
   pages: EpubPage[],
   outputPath: string,
   pdfPath: string,
+  imagesDir: string | null | undefined,
   verbose: boolean,
 ): Promise<void> {
   const title = deriveTitleFromPath(pdfPath);
   const uuid = randomUUID();
   const total = pages.length;
 
+  const imagePages = pages.filter((p) => p.imageOnly);
   if (verbose) {
-    console.log(`[EPUB] Building "${title}" — ${total} page(s)...`);
+    console.log(
+      `[EPUB] Building "${title}" — ${total} page(s)` +
+      (imagePages.length ? `, ${imagePages.length} image page(s)` : "") +
+      `...`,
+    );
   }
 
   const zip = new JSZip();
@@ -400,14 +469,33 @@ export async function generateEpub(
   zip.file("EPUB/toc.ncx",     buildNcx(pages, title, uuid));
   zip.file("EPUB/style.css",   STYLE_CSS);
 
+  // Embed JPEG files for image-only pages
+  if (imagesDir && imagePages.length > 0) {
+    for (const { pageNum } of imagePages) {
+      const imgName = `page_${String(pageNum).padStart(3, "0")}.jpg`;
+      const imgPath = join(imagesDir, imgName);
+      try {
+        const imgData = await readFile(imgPath);
+        zip.file(`EPUB/images/${imgName}`, imgData);
+        if (verbose) {
+          console.log(`[EPUB]   images/${imgName} — ${Math.round(imgData.length / 1024)} KB`);
+        }
+      } catch {
+        console.warn(`[EPUB]   Warning: image not found for page ${pageNum}: ${imgPath}`);
+      }
+    }
+  }
+
   // One XHTML file per page
-  for (const { pageNum, html } of pages) {
-    const cleanedHtml = cleanHtmlFragment(html);
-    const xhtml = buildPageXhtml(pageNum, total, cleanedHtml, title);
+  for (const { pageNum, html, imageOnly } of pages) {
+    const cleanedHtml = imageOnly ? "" : cleanHtmlFragment(html);
+    const xhtml = buildPageXhtml(pageNum, total, cleanedHtml, title, imageOnly);
     zip.file(`EPUB/${pageFileName(pageNum)}`, xhtml);
 
-    if (verbose) {
+    if (verbose && !imageOnly) {
       console.log(`[EPUB]   page_${String(pageNum).padStart(3, "0")}.xhtml — ${cleanedHtml.length} chars`);
+    } else if (verbose && imageOnly) {
+      console.log(`[EPUB]   page_${String(pageNum).padStart(3, "0")}.xhtml — image`);
     }
   }
 
