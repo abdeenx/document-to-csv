@@ -46,7 +46,22 @@ const EPUB_SYSTEM_PROMPT = [
   "You are a document page-to-HTML converter specializing in Arabic and Latin text.",
   "Your output will be embedded directly into an EPUB XHTML page file.",
   "",
-  "Convert the document page image to a clean HTML5 content fragment.",
+  "──────────────────────────────────────────────────────────────────",
+  "STEP 1 — CLASSIFY THE PAGE (do this first, before anything else):",
+  "──────────────────────────────────────────────────────────────────",
+  "If the page is primarily a full-page image with NO significant readable text",
+  "(e.g. book cover, decorative illustration, photograph, full-page diagram,",
+  "ornamental page), output EXACTLY the following single line — nothing else:",
+  "",
+  "  IMAGE_ONLY",
+  "",
+  "Do NOT output IMAGE_ONLY if the page contains any readable text content",
+  "(even if the text is overlaid on an image or decorative background).",
+  "",
+  "──────────────────────────────────────────────────────────────────",
+  "STEP 2 — FOR TEXT PAGES: produce an HTML fragment",
+  "──────────────────────────────────────────────────────────────────",
+  "Convert the document page to a clean HTML5 content fragment.",
   "",
   "STRICT OUTPUT FORMAT:",
   "- Output ONLY the HTML content — no <html>, <head>, <body>, or <!DOCTYPE> tags.",
@@ -71,6 +86,20 @@ const EPUB_SYSTEM_PROMPT = [
   "  - Reproduce every Latin character, number, and punctuation mark exactly.",
   "  - Do NOT translate, transliterate, paraphrase, or summarize anything.",
 ].join("\n");
+
+/** Returns true when the model indicates the page is a full-page image. */
+function isImageOnlyResponse(raw: string): boolean {
+  return /^IMAGE_ONLY\s*$/i.test(raw.trim());
+}
+
+/**
+ * Directory where rendered JPEGs are stored for image-only pages.
+ * Lives alongside the progress file so it survives resume cycles.
+ * e.g.  /path/to/book.epub-progress.json  →  /path/to/book.epub-images/
+ */
+function imagesDir(progressPath: string): string {
+  return progressPath.replace(/\.epub-progress\.json$/i, ".epub-images");
+}
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -267,17 +296,37 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
             }
           }
 
-          // ── Qwen3 HTML extraction ───────────────────────────────────────────
+          // ── Qwen3 extraction / image detection ─────────────────────────────
           let html = "";
+          let pageIsImage = false;
           let inferMs = 0;
           if (pageImage) {
             const t = Date.now();
-            process.stdout.write(`         ${fmtClock(t)}  Qwen3-VL → HTML...`);
+            process.stdout.write(`         ${fmtClock(t)}  Qwen3-VL → classify + extract...`);
             try {
               const raw = await extractPageHtml(client, modelId, pageNum, pageImage, verbose);
-              html = cleanHtmlFragment(raw);
-              inferMs = Date.now() - t;
-              process.stdout.write(` done  ${fmtSec(inferMs)}  (${html.length} chars)\n`);
+
+              if (isImageOnlyResponse(raw)) {
+                // ── Image page: save JPEG to the images folder ──────────────
+                pageIsImage = true;
+                inferMs = Date.now() - t;
+                process.stdout.write(` IMAGE  ${fmtSec(inferMs)}\n`);
+
+                const imgFolder = imagesDir(progressPath);
+                await mkdir(imgFolder, { recursive: true });
+                const imgName = `page_${String(pageNum).padStart(3, "0")}.jpg`;
+                await writeFile(
+                  join(imgFolder, imgName),
+                  Buffer.from(pageImage.base64, "base64"),
+                );
+                console.log(`         Saved: ${imgFolder}/${imgName}`);
+                html = "";
+              } else {
+                // ── Text page: clean and keep the HTML fragment ─────────────
+                html = cleanHtmlFragment(raw);
+                inferMs = Date.now() - t;
+                process.stdout.write(` done  ${fmtSec(inferMs)}  (${html.length} chars)\n`);
+              }
             } catch (err) {
               inferMs = Date.now() - t;
               process.stdout.write(` failed  ${fmtSec(inferMs)}\n`);
@@ -293,7 +342,9 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
           {
             const t = Date.now();
             process.stdout.write(`         ${fmtClock(t)}  Saving progress...`);
-            progress.pages[pageKey] = { html };
+            progress.pages[pageKey] = pageIsImage
+              ? { html: "", imageOnly: true }
+              : { html };
             await saveProgress(progressPath, progress);
             const saveMs = Date.now() - t;
             process.stdout.write(` done  ${fmtSec(saveMs)}\n`);
@@ -307,7 +358,10 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
           const remaining = numPages - pageNum;
 
           console.log(`         ${DIVIDER}`);
-          const parts = [`render ${fmtSec(renderMs)}`, `inference ${fmtSec(inferMs)}`];
+          const parts = [
+            `render ${fmtSec(renderMs)}`,
+            pageIsImage ? `image detected` : `inference ${fmtSec(inferMs)}`,
+          ];
 
           if (remaining > 0) {
             console.log(
@@ -332,12 +386,23 @@ export async function convertPdfToEpub(args: QwenEpubArgs): Promise<void> {
         const t = Date.now();
         process.stdout.write(`[EPUB] ${fmtClock(t)}  Assembling EPUB package...`);
 
-        const orderedPages = Array.from({ length: numPages }, (_, i) => ({
-          pageNum: i + 1,
-          html: progress.pages[String(i + 1)]?.html ?? "",
-        }));
+        const orderedPages = Array.from({ length: numPages }, (_, i) => {
+          const entry = progress.pages[String(i + 1)];
+          return {
+            pageNum: i + 1,
+            html: entry?.html ?? "",
+            imageOnly: entry?.imageOnly ?? false,
+          };
+        });
 
-        await generateEpub(orderedPages, outputPath, pdfPath, verbose);
+        const hasImagePages = orderedPages.some((p) => p.imageOnly);
+        await generateEpub(
+          orderedPages,
+          outputPath,
+          pdfPath,
+          hasImagePages ? imagesDir(progressPath) : null,
+          verbose,
+        );
         const buildMs = Date.now() - t;
         process.stdout.write(` done  ${fmtSec(buildMs)}\n`);
       }
