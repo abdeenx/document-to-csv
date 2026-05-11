@@ -43,6 +43,8 @@ export const CliArgsSchema = z.object({
   qwen3Word: z.boolean().default(false),
   qwen3Review: z.boolean().default(false),
   reviewWordPath: z.string().optional(),
+  epub: z.boolean().default(false),
+  epubModel: z.string().default("qwen/qwen3-vl-8b"),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
@@ -167,6 +169,21 @@ export type WordProgress = z.infer<typeof WordProgressSchema>;
 // ---------------------------------------------------------------------------
 // Qwen single-model pipeline progress tracking
 // ---------------------------------------------------------------------------
+
+/**
+ * Progress file for the PDF → EPUB pipeline.
+ * One entry per page containing the raw HTML fragment from Qwen3-VL.
+ */
+export const EpubProgressSchema = z.object({
+  version: z.literal(1),
+  pdfPath: z.string(),
+  totalPages: z.number().int().positive(),
+  pages: z.record(
+    z.string().regex(/^\d+$/),
+    z.object({ html: z.string() }),
+  ),
+});
+export type EpubProgress = z.infer<typeof EpubProgressSchema>;
 
 /**
  * Progress file for the Qwen3-VL review pipeline (PDF + Word → corrected Word).
