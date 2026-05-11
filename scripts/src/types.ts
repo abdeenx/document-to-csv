@@ -180,7 +180,10 @@ export const EpubProgressSchema = z.object({
   totalPages: z.number().int().positive(),
   pages: z.record(
     z.string().regex(/^\d+$/),
-    z.object({ html: z.string() }),
+    z.object({
+      html: z.string(),
+      imageOnly: z.boolean().optional(),
+    }),
   ),
 });
 export type EpubProgress = z.infer<typeof EpubProgressSchema>;
