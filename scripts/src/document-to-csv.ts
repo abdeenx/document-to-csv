@@ -64,6 +64,7 @@ import { generateExcel } from "./excel-generator.js";
 import { convertPdfToWord, enhanceProgressFile } from "./pdf-to-word.js";
 import { convertPdfToWordWithQwen } from "./qwen-pdf-to-word.js";
 import { reviewWordWithQwen3 } from "./qwen3-review.js";
+import { convertPdfToEpub } from "./qwen3-epub.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -88,6 +89,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       "qwen3-review":       { type: "boolean", default: false },
       "review-word":        { type: "string" },
       "qwen3-model":        { type: "string" },
+      epub:                 { type: "boolean", default: false },
+      "epub-model":         { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
     },
@@ -105,10 +108,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     values["qwen-word"],
     values["qwen3-word"],
     values["qwen3-review"],
+    values.epub,
   ].filter(Boolean).length;
   if (modeCount > 1) {
     console.error(
-      "Error: --excel, --word, --qwen-word, --qwen3-word, and --qwen3-review are mutually exclusive.",
+      "Error: --excel, --word, --qwen-word, --qwen3-word, --qwen3-review, and --epub are mutually exclusive.",
     );
     process.exit(1);
   }
@@ -151,6 +155,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(1);
   }
 
+  if (values.epub && ext !== PDF_EXTENSION) {
+    console.error("Error: --epub mode requires a PDF input file.");
+    process.exit(1);
+  }
+
   const inputBase = basename(inputPath, extname(inputPath));
   const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
 
@@ -158,6 +167,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
   if (values.excel) outputExt = ".xlsx";
   else if (values.word || values["qwen-word"] || values["qwen3-word"] || values["qwen3-review"])
     outputExt = ".docx";
+  else if (values.epub) outputExt = ".epub";
   else outputExt = ".csv";
 
   // --qwen3-review defaults to <basename>-reviewed.docx to avoid overwriting the original.
@@ -185,6 +195,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     qwen3Word:      values["qwen3-word"]    ?? false,
     qwen3Review:    values["qwen3-review"]  ?? false,
     reviewWordPath: values["review-word"],
+    epub:           values.epub             ?? false,
+    epubModel:      values["epub-model"]    ?? "qwen/qwen3-vl-8b",
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -252,6 +264,16 @@ Options:
                                (default: mlx-community/Qwen2.5-VL-7B-Instruct-8bit)
   --qwen3-model <id>           Qwen3 vision model used by --qwen3-word and --qwen3-review
                                (default: qwen/qwen3-vl-8b)
+  --epub                       Write an EPUB file (PDF input only) using Qwen3-VL.
+                               Each PDF page becomes its own page_NNN.xhtml file inside
+                               the EPUB, so a human reviewer can open any page directly,
+                               compare it with the PDF, and edit the HTML in place.
+                               Arabic (RTL) and Latin (LTR) text are preserved with
+                               dir attributes on every block element.
+                               Progress is saved after every page — resumable.
+                               Progress file: <output>.epub-progress.json
+  --epub-model <id>            Vision model used by --epub
+                               (default: qwen/qwen3-vl-8b)
   -v, --verbose                Enable step-by-step logging
   -h, --help                   Show this help message
 
@@ -277,6 +299,33 @@ Examples:
 async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
+
+  // ── Mode 7: PDF → EPUB via Qwen3-VL ─────────────────────────────────────
+  if (args.epub) {
+    const progressPath = args.outputPath!.replace(/\.epub$/i, ".epub-progress.json");
+
+    console.log("document-to-csv (PDF → EPUB / Qwen3-VL mode)");
+    console.log("==============================================");
+    console.log(`  Input:          ${args.imagePath}`);
+    console.log(`  Output:         ${args.outputPath}`);
+    console.log(`  Progress file:  ${progressPath}`);
+    console.log(`  Model:          ${args.epubModel}`);
+    console.log(`  LM Studio:      ${args.lmStudioUrl}`);
+    console.log("");
+
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+
+    await convertPdfToEpub({
+      pdfPath:      args.imagePath,
+      outputPath:   args.outputPath!,
+      progressPath,
+      client,
+      modelId:      args.epubModel,
+      verbose:      args.verbose,
+    });
+
+    return;
+  }
 
   // ── Mode 6: PDF + Word → corrected Word via Qwen3-VL ────────────────────
   if (args.qwen3Review) {
