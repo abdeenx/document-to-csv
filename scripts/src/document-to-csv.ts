@@ -65,6 +65,7 @@ import { convertPdfToWord, enhanceProgressFile } from "./pdf-to-word.js";
 import { convertPdfToWordWithQwen } from "./qwen-pdf-to-word.js";
 import { reviewWordWithQwen3 } from "./qwen3-review.js";
 import { convertPdfToEpub } from "./qwen3-epub.js";
+import { convertPdfToRichWord } from "./rich-pdf-to-word.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -92,6 +93,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       "qwen3-model":        { type: "string" },
       epub:                 { type: "boolean", default: false },
       "epub-model":         { type: "string" },
+      "rich-word":          { type: "boolean", default: false },
+      "rich-word-model":    { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
     },
@@ -110,10 +113,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     values["qwen3-word"],
     values["qwen3-review"],
     values.epub,
+    values["rich-word"],
   ].filter(Boolean).length;
   if (modeCount > 1) {
     console.error(
-      "Error: --excel, --word, --qwen-word, --qwen3-word, --qwen3-review, and --epub are mutually exclusive.",
+      "Error: --excel, --word, --qwen-word, --qwen3-word, --qwen3-review, --epub, and --rich-word are mutually exclusive.",
     );
     process.exit(1);
   }
@@ -161,12 +165,17 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(1);
   }
 
+  if (values["rich-word"] && ext !== PDF_EXTENSION) {
+    console.error("Error: --rich-word mode requires a PDF input file.");
+    process.exit(1);
+  }
+
   const inputBase = basename(inputPath, extname(inputPath));
   const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
 
   let outputExt: string;
   if (values.excel) outputExt = ".xlsx";
-  else if (values.word || values["qwen-word"] || values["qwen3-word"] || values["qwen3-review"])
+  else if (values.word || values["qwen-word"] || values["qwen3-word"] || values["qwen3-review"] || values["rich-word"])
     outputExt = ".docx";
   else if (values.epub) outputExt = ".epub";
   else outputExt = ".csv";
@@ -198,7 +207,9 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     qwen3Review:    values["qwen3-review"]  ?? false,
     reviewWordPath: values["review-word"],
     epub:           values.epub             ?? false,
-    epubModel:      values["epub-model"]    ?? "qwen/qwen3-vl-8b",
+    epubModel:      values["epub-model"]       ?? "qwen/qwen3-vl-8b",
+    richWord:       values["rich-word"]        ?? false,
+    richWordModel:  values["rich-word-model"]  ?? "qwen/qwen3-vl-8b",
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -280,6 +291,20 @@ Options:
                                Progress file: <output>.epub-progress.json
   --epub-model <id>            Vision model used by --epub
                                (default: qwen/qwen3-vl-8b)
+  --rich-word                  Write a Word (.docx) file (PDF input only) with
+                               BOTH transcribed text AND embedded images cropped
+                               from each PDF page.
+                               The model identifies every visual element on each
+                               page with a bounding box; sharp crops that region
+                               from the rendered JPEG and the image is embedded
+                               in the Word document at the correct reading position
+                               (inline, between surrounding paragraphs).
+                               Arabic (RTL) and Latin (LTR) text are preserved.
+                               Progress is saved after every page — resumable.
+                               Progress file: <output>.rich-progress.json
+                               Images folder: <output>.rich-images/
+  --rich-word-model <id>       Vision model used by --rich-word
+                               (default: qwen/qwen3-vl-8b)
   -v, --verbose                Enable step-by-step logging
   -h, --help                   Show this help message
 
@@ -305,6 +330,33 @@ Examples:
 async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
+
+  // ── Mode 8: PDF → Rich Word (text + embedded images) via Qwen3-VL ───────
+  if (args.richWord) {
+    const progressPath = args.outputPath!.replace(/\.docx$/i, ".rich-progress.json");
+
+    console.log("document-to-csv (PDF → Rich Word / Qwen3-VL mode)");
+    console.log("====================================================");
+    console.log(`  Input:          ${args.imagePath}`);
+    console.log(`  Output:         ${args.outputPath}`);
+    console.log(`  Progress file:  ${progressPath}`);
+    console.log(`  Model:          ${args.richWordModel}`);
+    console.log(`  LM Studio:      ${args.lmStudioUrl}`);
+    console.log("");
+
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
+
+    await convertPdfToRichWord({
+      pdfPath:      args.imagePath,
+      outputPath:   args.outputPath!,
+      progressPath,
+      client,
+      modelId:      args.richWordModel,
+      verbose:      args.verbose,
+    });
+
+    return;
+  }
 
   // ── Mode 7: PDF → EPUB via Qwen3-VL ─────────────────────────────────────
   if (args.epub) {

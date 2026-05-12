@@ -46,6 +46,8 @@ export const CliArgsSchema = z.object({
   reviewWordPath: z.string().optional(),
   epub: z.boolean().default(false),
   epubModel: z.string().default("qwen/qwen3-vl-8b"),
+  richWord: z.boolean().default(false),
+  richWordModel: z.string().default("qwen/qwen3-vl-8b"),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 
@@ -185,6 +187,21 @@ export const EpubProgressSchema = z.object({
   ),
 });
 export type EpubProgress = z.infer<typeof EpubProgressSchema>;
+
+/**
+ * Progress file for the Rich Word pipeline (PDF → DOCX with embedded images).
+ * One entry per page storing the processed HTML (with real <img> tags).
+ */
+export const RichWordProgressSchema = z.object({
+  version: z.literal(1),
+  pdfPath: z.string(),
+  totalPages: z.number().int().positive(),
+  pages: z.record(
+    z.string().regex(/^\d+$/),
+    z.object({ html: z.string() }),
+  ),
+});
+export type RichWordProgress = z.infer<typeof RichWordProgressSchema>;
 
 /**
  * Progress file for the Qwen3-VL review pipeline (PDF + Word → corrected Word).

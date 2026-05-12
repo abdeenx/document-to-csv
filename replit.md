@@ -13,6 +13,7 @@ Key flags:
 - `--word` — write `.docx` from PDF; 4 OCR models in parallel + Gemma4 corroboration; Arabic RTL; resumable
 - `--enhance` — re-run OCR on weak pages in an existing `--word` progress file, then regenerate docx
 - `--qwen-word` — write `.docx` from PDF using a **single Qwen2.5-VL call per page**; no corroboration needed; Arabic RTL; resumable
+- `--rich-word` — write `.docx` from PDF with **both text and embedded images** cropped from each page; images appear inline at the correct reading position; Arabic RTL; resumable
 - `--verbose` — step-by-step logging
 - `--output <path>` — custom output path
 
@@ -40,6 +41,8 @@ brew install mupdf-tools  # mutool (fallback)
 | `--excel` | DeepSeek-OCR + Gemma4 | XLSX |
 | `--word` | DeepSeek-OCR + dots.ocr + GLM-OCR + Chandra-OCR + Gemma4 | DOCX (4-model corroboration) |
 | `--qwen-word` | Qwen2.5-VL-7B-Instruct-8bit | DOCX (single-model, fast) |
+| `--epub` | Qwen3-VL | EPUB (text + cropped images, HTML) |
+| `--rich-word` | Qwen3-VL | DOCX (text + cropped images embedded inline) |
 
 ## Where things live
 
@@ -52,7 +55,11 @@ brew install mupdf-tools  # mutool (fallback)
 - `scripts/src/pdf-to-word.ts` — 4-OCR-model parallel pipeline + Gemma4 corroboration + progress tracking (`--word`)
 - `scripts/src/qwen-pdf-to-word.ts` — single-model Qwen2.5-VL pipeline + progress tracking (`--qwen-word`)
 - `scripts/src/word-generator.ts` — `generateWordDoc()`: docx with Arabic RTL, headings, tables, page breaks
-- `scripts/src/document-to-csv.ts` — CLI entry; routes PDF/image and --excel/--word/--qwen-word/--csv
+- `scripts/src/epub-generator.ts` — `cleanHtmlFragment()` + `generateEpub()`; exports `EpubPage` type
+- `scripts/src/qwen3-epub.ts` — Qwen3-VL single-call per page pipeline with `data-region` figure extraction + EPUB assembly (`--epub`)
+- `scripts/src/html-to-docx-converter.ts` — HTML fragment → `(Paragraph | Table)[]` via docx v9; handles h2/h3/p/figure/ul/ol/table/hr + Arabic RTL; used by `--rich-word`
+- `scripts/src/rich-pdf-to-word.ts` — Qwen3-VL pipeline (render → model → crop images → progress) + DOCX assembly (`--rich-word`)
+- `scripts/src/document-to-csv.ts` — CLI entry; routes PDF/image across all 8 modes
 
 ## Architecture decisions
 
