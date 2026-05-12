@@ -20,6 +20,7 @@ export const CliArgsSchema = z.object({
   imagePath: z.string().min(1, "Image path is required"),
   outputPath: z.string().optional(),
   lmStudioUrl: z.string().url().default("http://localhost:1234/v1"),
+  apiKey: z.string().default("lm-studio"),
   ocrModel: z.string().default("mlx-community/DeepSeek-OCR-8bit"),
   dotsOcrModel: z.string().default("mlx-community/dots.ocr-bf16"),
   glmOcrModel: z.string().default("mlx-community/GLM-OCR-bf16"),
