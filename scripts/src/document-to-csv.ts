@@ -79,6 +79,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       enhance:            { type: "boolean", default: false },
       "qwen-word":          { type: "boolean", default: false },
       "lm-studio-url":      { type: "string" },
+      "api-key":            { type: "string" },
       "ocr-model":          { type: "string" },
       "dots-ocr-model":     { type: "string" },
       "glm-ocr-model":      { type: "string" },
@@ -179,6 +180,7 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     imagePath:       resolve(callerCwd, inputPath),
     outputPath:      values.output ? resolve(callerCwd, values.output) : defaultOutput,
     lmStudioUrl:     values["lm-studio-url"]    ?? "http://localhost:1234/v1",
+    apiKey:          values["api-key"]          ?? "lm-studio",
     ocrModel:        values["ocr-model"]          ?? "mlx-community/DeepSeek-OCR-8bit",
     dotsOcrModel:    values["dots-ocr-model"]     ?? "mlx-community/dots.ocr-bf16",
     glmOcrModel:     values["glm-ocr-model"]      ?? "mlx-community/GLM-OCR-bf16",
@@ -256,7 +258,11 @@ Options:
                                Progress is saved after every page — resumable.
   --review-word <path>         Path to the Word (.docx) file used as input for
                                --qwen3-review.
-  --lm-studio-url <url>        LM Studio base URL (default: http://localhost:1234/v1)
+  --lm-studio-url <url>        LM Studio / inference server base URL
+                               (default: http://localhost:1234/v1)
+  --api-key <key>              API key sent in the Authorization header
+                               (default: "lm-studio" — correct for LM Studio;
+                                use your server's actual key for other backends)
   --ocr-model <id>             OCR model (default: mlx-community/DeepSeek-OCR-8bit)
   --structurer-model <id>      Structuring / corroboration model
                                (default: zecanard/gemma-4-e4b-it-ultra-uncensored-heretic-mlx-int5-affine)
@@ -313,7 +319,7 @@ async function main(): Promise<void> {
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
-    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
     await convertPdfToEpub({
       pdfPath:      args.imagePath,
@@ -342,7 +348,7 @@ async function main(): Promise<void> {
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
-    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
     await reviewWordWithQwen3({
       pdfPath:       args.imagePath,
@@ -370,7 +376,7 @@ async function main(): Promise<void> {
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
-    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
     await convertPdfToWordWithQwen({
       pdfPath:      args.imagePath,
@@ -398,7 +404,7 @@ async function main(): Promise<void> {
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
-    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
     await convertPdfToWordWithQwen({
       pdfPath:      args.imagePath,
@@ -431,7 +437,7 @@ async function main(): Promise<void> {
     console.log(`  LM Studio:      ${args.lmStudioUrl}`);
     console.log("");
 
-    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
     const wordArgs = {
       pdfPath:            args.imagePath,
@@ -471,7 +477,7 @@ async function main(): Promise<void> {
   console.log(`  LM Studio:    ${args.lmStudioUrl}`);
   console.log("");
 
-  const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: "lm-studio" });
+  const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
 
   // ── Step 1: Extract text ──────────────────────────────────────────────────
   console.log(
