@@ -66,6 +66,7 @@ import { convertPdfToWordWithQwen } from "./qwen-pdf-to-word.js";
 import { reviewWordWithQwen3 } from "./qwen3-review.js";
 import { convertPdfToEpub } from "./qwen3-epub.js";
 import { convertPdfToRichWord } from "./rich-pdf-to-word.js";
+import { convertPdfToWordWithOmlx } from "./omlx-pdf-to-word.js";
 
 const PDF_EXTENSION    = ".pdf";
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -95,6 +96,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
       "epub-model":         { type: "string" },
       "rich-word":          { type: "boolean", default: false },
       "rich-word-model":    { type: "string" },
+      "omlx-word":          { type: "boolean", default: false },
+      "omlx-model":         { type: "string" },
       verbose:            { type: "boolean", short: "v", default: false },
       help:               { type: "boolean", short: "h", default: false },
     },
@@ -114,10 +117,11 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     values["qwen3-review"],
     values.epub,
     values["rich-word"],
+    values["omlx-word"],
   ].filter(Boolean).length;
   if (modeCount > 1) {
     console.error(
-      "Error: --excel, --word, --qwen-word, --qwen3-word, --qwen3-review, --epub, and --rich-word are mutually exclusive.",
+      "Error: --excel, --word, --qwen-word, --qwen3-word, --qwen3-review, --epub, --rich-word, and --omlx-word are mutually exclusive.",
     );
     process.exit(1);
   }
@@ -170,12 +174,17 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     process.exit(1);
   }
 
+  if (values["omlx-word"] && ext !== PDF_EXTENSION) {
+    console.error("Error: --omlx-word mode requires a PDF input file.");
+    process.exit(1);
+  }
+
   const inputBase = basename(inputPath, extname(inputPath));
   const callerCwd = process.env["INIT_CWD"] ?? process.cwd();
 
   let outputExt: string;
   if (values.excel) outputExt = ".xlsx";
-  else if (values.word || values["qwen-word"] || values["qwen3-word"] || values["qwen3-review"] || values["rich-word"])
+  else if (values.word || values["qwen-word"] || values["qwen3-word"] || values["qwen3-review"] || values["rich-word"] || values["omlx-word"])
     outputExt = ".docx";
   else if (values.epub) outputExt = ".epub";
   else outputExt = ".csv";
@@ -210,6 +219,8 @@ function parseCliArgs(): ReturnType<typeof CliArgsSchema.parse> {
     epubModel:      values["epub-model"]       ?? "qwen/qwen3-vl-8b",
     richWord:       values["rich-word"]        ?? false,
     richWordModel:  values["rich-word-model"]  ?? "qwen/qwen3-vl-8b",
+    omlxWord:       values["omlx-word"]        ?? false,
+    omlxModel:      values["omlx-model"]       ?? "Qwen3-VL-30B-A3B-Instruct-MLX-8bit",
   };
 
   const result = CliArgsSchema.safeParse(raw);
@@ -305,6 +316,19 @@ Options:
                                Images folder: <output>.rich-images/
   --rich-word-model <id>       Vision model used by --rich-word
                                (default: qwen/qwen3-vl-8b)
+  --omlx-word                  Write a Word (.docx) from a scanned Arabic book PDF
+                               using the local omlx server + Qwen3-VL-30B.
+                               Applies Qwen3-VL OCR cookbook techniques:
+                                 · No system prompt (proven to improve OCR accuracy)
+                                 · Image placed before the text prompt
+                                 · Short, direct Arabic OCR prompt
+                                 · temperature=0  max_tokens=8192
+                               Arabic RTL and paragraph structure are preserved.
+                               Progress is saved after every page — resumable.
+                               Progress file: <output>.omlx-progress.json
+                               Server URL: set via --lm-studio-url
+  --omlx-model <id>            Model served by omlx used for --omlx-word
+                               (default: Qwen3-VL-30B-A3B-Instruct-MLX-8bit)
   -v, --verbose                Enable step-by-step logging
   -h, --help                   Show this help message
 
@@ -330,6 +354,34 @@ Examples:
 async function main(): Promise<void> {
   const args  = parseCliArgs();
   const isPdf = extname(args.imagePath).toLowerCase() === PDF_EXTENSION;
+
+  // ── Mode 9: PDF → Word via omlx + Qwen3-VL-30B (Arabic book OCR) ────────
+  if (args.omlxWord) {
+    const progressPath = args.outputPath!.replace(/\.docx$/i, ".omlx-progress.json");
+
+    console.log("document-to-csv (PDF → Word / omlx + Qwen3-VL Arabic OCR mode)");
+    console.log("=================================================================");
+    console.log(`  Input:          ${args.imagePath}`);
+    console.log(`  Output:         ${args.outputPath}`);
+    console.log(`  Progress file:  ${progressPath}`);
+    console.log(`  Model:          ${args.omlxModel}`);
+    console.log(`  Server:         ${args.lmStudioUrl}`);
+    console.log(`  Techniques:     no system prompt · image-first · direct OCR prompt`);
+    console.log("");
+
+    const client = createLmStudioClient({ baseUrl: args.lmStudioUrl, apiKey: args.apiKey });
+
+    await convertPdfToWordWithOmlx({
+      pdfPath:      args.imagePath,
+      outputPath:   args.outputPath!,
+      progressPath,
+      client,
+      modelId:      args.omlxModel,
+      verbose:      args.verbose,
+    });
+
+    return;
+  }
 
   // ── Mode 8: PDF → Rich Word (text + embedded images) via Qwen3-VL ───────
   if (args.richWord) {

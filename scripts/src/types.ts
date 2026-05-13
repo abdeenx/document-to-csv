@@ -48,6 +48,8 @@ export const CliArgsSchema = z.object({
   epubModel: z.string().default("qwen/qwen3-vl-8b"),
   richWord: z.boolean().default(false),
   richWordModel: z.string().default("qwen/qwen3-vl-8b"),
+  omlxWord: z.boolean().default(false),
+  omlxModel: z.string().default("Qwen3-VL-30B-A3B-Instruct-MLX-8bit"),
 });
 export type CliArgs = z.infer<typeof CliArgsSchema>;
 

@@ -14,6 +14,7 @@ Key flags:
 - `--enhance` — re-run OCR on weak pages in an existing `--word` progress file, then regenerate docx
 - `--qwen-word` — write `.docx` from PDF using a **single Qwen2.5-VL call per page**; no corroboration needed; Arabic RTL; resumable
 - `--rich-word` — write `.docx` from PDF with **both text and embedded images** cropped from each page; images appear inline at the correct reading position; Arabic RTL; resumable
+- `--omlx-word` — write `.docx` from scanned Arabic book PDF via the **local omlx server** + Qwen3-VL-30B; uses Qwen3-VL OCR cookbook techniques (no system prompt, image-first, direct prompt, temp=0, max_tokens=8192)
 - `--verbose` — step-by-step logging
 - `--output <path>` — custom output path
 
@@ -43,6 +44,7 @@ brew install mupdf-tools  # mutool (fallback)
 | `--qwen-word` | Qwen2.5-VL-7B-Instruct-8bit | DOCX (single-model, fast) |
 | `--epub` | Qwen3-VL | EPUB (text + cropped images, HTML) |
 | `--rich-word` | Qwen3-VL | DOCX (text + cropped images embedded inline) |
+| `--omlx-word` | Qwen3-VL-30B (omlx) | DOCX (Arabic book OCR; cookbook prompts) |
 
 ## Where things live
 
@@ -59,7 +61,8 @@ brew install mupdf-tools  # mutool (fallback)
 - `scripts/src/qwen3-epub.ts` — Qwen3-VL single-call per page pipeline with `data-region` figure extraction + EPUB assembly (`--epub`)
 - `scripts/src/html-to-docx-converter.ts` — HTML fragment → `(Paragraph | Table)[]` via docx v9; handles h2/h3/p/figure/ul/ol/table/hr + Arabic RTL; used by `--rich-word`
 - `scripts/src/rich-pdf-to-word.ts` — Qwen3-VL pipeline (render → model → crop images → progress) + DOCX assembly (`--rich-word`)
-- `scripts/src/document-to-csv.ts` — CLI entry; routes PDF/image across all 8 modes
+- `scripts/src/omlx-pdf-to-word.ts` — omlx/Qwen3-VL-30B pipeline; Arabic book OCR; cookbook techniques (no system prompt, image-first, direct prompt, temp=0, max_tokens=8192) (`--omlx-word`)
+- `scripts/src/document-to-csv.ts` — CLI entry; routes PDF/image across all 9 modes
 
 ## Architecture decisions
 
